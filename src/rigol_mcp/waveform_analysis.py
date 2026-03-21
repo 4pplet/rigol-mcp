@@ -12,8 +12,12 @@ def _fmt_si(value: float, unit: str) -> str:
     return f"{value:.4g} {unit}"
 
 
-def describe_waveform(data: dict) -> str:
-    """Produce a human-readable analysis of a waveform capture."""
+def describe_waveform(data: dict, half_screen_divs: int = 6) -> str:
+    """Produce a human-readable analysis of a waveform capture.
+
+    half_screen_divs: number of divisions from center to edge (6 for DS1000Z, 5 for DHO800).
+    Used in the right-edge warning to suggest a corrective offset formula.
+    """
     voltages = data["voltages_v"]
     times    = data["times_s"]
     n        = len(voltages)
@@ -196,7 +200,8 @@ def describe_waveform(data: dict) -> str:
 
     if abs(voltages[-1] - vmean) > edge_thr:
         if period_est:
-            suggested = f"  To fix: set offset = N×{_fmt_si(period_est/2,'s')} − 6×scale for integer N."
+            hp = _fmt_si(period_est / 2, 's')
+            suggested = f"  To fix: set offset = N×{hp} − {half_screen_divs}×scale for integer N."
         else:
             suggested = ""
         warnings.append(

@@ -1,30 +1,43 @@
-"""Rigol DS1000Z MCP server."""
+"""Rigol DS1000Z / DHO800 MCP server."""
 
+import asyncio
 import base64
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
-
-
-import asyncio
-import time
 
 import mcp.types as types
 import pyvisa
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from rigol_mcp.waveform_analysis import describe_waveform as _describe_waveform
 from rigol_mcp.scope import (
-    get_scope, invalidate_scope,
+    autoscale,
+    check_scpi_error,
+    get_cursor_mode,
+    get_cursor_values,
+    get_profile,
+    get_scope,
+    get_scope_state,
+    get_waveform,
+    idn,
+    invalidate_scope,
+    measure,
+    measure_between,
+    run,
     screenshot_png,
-    get_cursor_mode, set_cursor_mode, set_cursor_positions, get_cursor_values,
-    send_raw, check_scpi_error,
-    run, stop, single, autoscale,
-    idn, measure, measure_between, MEASURE_ITEMS, MEASURE_ITEMS_TWO_SOURCE,
-    get_scope_state, set_channel, set_timebase, set_trigger, get_waveform,
+    send_raw,
+    set_channel,
+    set_cursor_mode,
+    set_cursor_positions,
+    set_timebase,
+    set_trigger,
+    single,
+    stop,
 )
+from rigol_mcp.waveform_analysis import describe_waveform as _describe_waveform
 
 server = Server("rigol-mcp")
 
@@ -102,7 +115,10 @@ async def list_tools() -> list[types.Tool]:
                     "scale_v_div": {"type": ["number", "string"], "description": "Vertical scale in V/div"},
                     "offset_v":   {"type": ["number", "string"], "description": "Vertical offset in volts"},
                     "coupling":   {"type": "string", "enum": ["AC", "DC", "GND"]},
-                    "probe":      {"type": ["number", "string"], "description": "Probe attenuation ratio (e.g. 1, 10, 100)"},
+                    "probe":      {
+                        "type": ["number", "string"],
+                        "description": "Probe attenuation ratio (e.g. 1, 10, 100)",
+                    },
                 },
                 "required": ["channel"],
             },
@@ -112,10 +128,12 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Set the horizontal timebase. "
                 "scale_s_div: seconds per division (e.g. 0.001 for 1 ms/div). "
-                "offset_s: shifts the display window; time_start = offset_s − 6×scale_s_div, time_end = offset_s + 6×scale_s_div. "
+                "offset_s: shifts the display window; time_start = offset_s − N×scale_s_div, "
+                "time_end = offset_s + N×scale_s_div, where N = half the screen divisions "
+                "(6 for DS1000Z, 5 for DHO800). "
                 "Trigger (t=0) is always a zero crossing when using edge trigger. "
-                "To align the right edge to a zero crossing at time T: set offset_s = T − 6×scale_s_div. "
-                "To put the trigger at the left edge of the screen: set offset_s = +6×scale_s_div. "
+                "To align the right edge to a zero crossing at time T: set offset_s = T − N×scale_s_div. "
+                "To put the trigger at the left edge of the screen: set offset_s = +N×scale_s_div. "
                 "Parameter names match get_scope_state output for easy round-tripping. "
                 "Returns the resulting timebase configuration. "
                 "Do not call concurrently with any other rigol tool."
@@ -180,17 +198,32 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Query a two-source delay or phase measurement between two channels. "
                 "source1 is the reference channel, source2 is the measured channel. "
-                "item: RDELAY (rising-edge delay, seconds), FDELAY (falling-edge delay, seconds), "
-                "RPHASE (rising-edge phase, degrees), FPHASE (falling-edge phase, degrees). "
+                "DS1000Z items: RDELAY (rising-edge delay), FDELAY (falling-edge delay), "
+                "RPHASE (rising-edge phase), FPHASE (falling-edge phase). "
+                "DHO800 items: RRDELAY, FFDELAY, RRPHASE, FFPHASE, plus cross-edge: "
+                "RFDELAY, FRDELAY, RFPHASE, FRPHASE. "
+                "DS1000Z names are automatically translated when connected to a DHO800. "
                 "Stop acquisition first for stable readings. "
                 "Do not call concurrently with any other rigol tool."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "source1": {"type": "string", "enum": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"], "description": "Reference channel"},
-                    "source2": {"type": "string", "enum": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"], "description": "Measured channel"},
-                    "item":    {"type": "string", "enum": ["RDELAY", "FDELAY", "RPHASE", "FPHASE"]},
+                    "source1": {
+                        "type": "string",
+                        "enum": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"],
+                        "description": "Reference channel",
+                    },
+                    "source2": {
+                        "type": "string",
+                        "enum": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"],
+                        "description": "Measured channel",
+                    },
+                    "item":    {"type": "string", "enum": [
+                        "RDELAY", "FDELAY", "RPHASE", "FPHASE",
+                        "RRDELAY", "FFDELAY", "RRPHASE", "FFPHASE",
+                        "RFDELAY", "FRDELAY", "RFPHASE", "FRPHASE",
+                    ]},
                 },
                 "required": ["source1", "source2", "item"],
             },
@@ -198,20 +231,24 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="get_waveform",
             description=(
-                "Download and analyse the current waveform for a channel (screen buffer, ~1200 points). "
+                "Download and analyse the current waveform for a channel (screen buffer). "
                 "Stop or single-trigger the scope first for consistent data. "
                 "By default returns a plain-text analysis: signal shape, frequency/period, amplitude, "
                 "DC offset, cycle count, and data-quality warnings (e.g. mid-cycle edges, invalid frequency). "
                 "Set raw_data=true to get the full time/voltage JSON arrays instead. "
                 "After reading, act on any warnings — if FREQUENCY would be 9.9E37 widen the timebase; "
-                "if edges are not near the DC mean, adjust offset so right edge = N×(period/2) − 6×scale. "
+                "if edges are not near the DC mean, adjust offset so right edge = N×(period/2) − N_half×scale "
+                "(N_half = 6 for DS1000Z, 5 for DHO800). "
                 "Do not call concurrently with any other rigol tool."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel":  {"type": "string", "enum": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"]},
-                    "raw_data": {"type": "boolean", "description": "Return raw time/voltage JSON arrays instead of text analysis (default false)"},
+                    "raw_data": {
+                        "type": "boolean",
+                        "description": "Return raw time/voltage arrays instead of text analysis (default false)",
+                    },
                 },
                 "required": ["channel"],
             },
@@ -256,19 +293,28 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "SCPI command, e.g. ':CHAN1:SCAL?' or ':CHAN1:DISP ON'"},
+                    "command": {
+                        "type": "string",
+                        "description": "SCPI command, e.g. ':CHAN1:SCAL?' or ':CHAN1:DISP ON'",
+                    },
                 },
                 "required": ["command"],
             },
         ),
         types.Tool(
             name="check_error",
-            description="Query the SCPI error queue. Returns the error if present, or 'No error' if clear. Do not call concurrently with any other rigol tool.",
+            description=(
+                "Query the SCPI error queue. Returns the error if present, "
+                "or 'No error' if clear. Do not call concurrently with any other rigol tool."
+            ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="run",
-            description="Start continuous acquisition. Returns trigger status after the command. Do not call concurrently with any other rigol tool.",
+            description=(
+                "Start continuous acquisition. Returns trigger status after the command. "
+                "Do not call concurrently with any other rigol tool."
+            ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
@@ -383,7 +429,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
         data = await _call(get_waveform, arguments["channel"])
         if arguments.get("raw_data"):
             return [types.TextContent(type="text", text=json.dumps(data))]
-        return [types.TextContent(type="text", text=_describe_waveform(data))]
+        prof = get_profile()
+        return [types.TextContent(type="text", text=_describe_waveform(data, prof.half_screen_divs))]
 
     if name == "set_cursors":
         mode = arguments.get("mode")

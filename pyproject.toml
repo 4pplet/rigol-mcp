@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "rigol-mcp"
 version = "0.1.0"
-description = "MCP server for Rigol DS1000Z oscilloscope over LAN"
+description = "MCP server for Rigol DS1000Z / DHO800 oscilloscope over LAN"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0.0",
@@ -13,8 +13,38 @@ dependencies = [
     "pyvisa-py>=0.7.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
 [project.scripts]
 rigol-mcp = "rigol_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rigol_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = "pyvisa.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "rigol_mcp.scope"
+# pyvisa.resources.Resource stubs lack query/write/read_bytes attrs
+disable_error_code = ["attr-defined", "no-any-return"]

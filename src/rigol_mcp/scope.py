@@ -1,17 +1,90 @@
-"""VISA connection and SCPI helpers for Rigol DS1000Z."""
+"""VISA connection and SCPI helpers for Rigol DS1000Z and DHO800/DHO900."""
 
+import contextlib
 import os
+from dataclasses import dataclass
+from enum import Enum
+
 import pyvisa
 
-# Screen geometry constants (DS1000Z series)
-_SCREEN_DIVISIONS = 12
-_POINTS_PER_DIV = 50          # empirically confirmed: 600 points across 12 divisions
-_SCREEN_POINTS = _SCREEN_DIVISIONS * _POINTS_PER_DIV  # 600
-_SCREEN_CENTER = _SCREEN_POINTS // 2                  # 300
+# ---------------------------------------------------------------------------
+# Scope family detection & model-specific constants
+# ---------------------------------------------------------------------------
 
-# Module-level cached connection
+class ScopeFamily(Enum):
+    DS1000Z = "DS1000Z"
+    DHO800 = "DHO800"
+
+
+@dataclass(frozen=True)
+class ScopeProfile:
+    """Model-specific constants derived from the programming guide."""
+    family: ScopeFamily
+    screen_divisions: int
+    points_per_div: int
+    half_screen_divs: int          # divisions from center to edge
+    max_channels: int              # number of analog channels (2 or 4)
+
+    @property
+    def screen_points(self) -> int:
+        return self.screen_divisions * self.points_per_div
+
+    @property
+    def screen_center(self) -> int:
+        return self.screen_points // 2
+
+
+_PROFILES: dict[ScopeFamily, ScopeProfile] = {
+    ScopeFamily.DS1000Z: ScopeProfile(
+        family=ScopeFamily.DS1000Z,
+        screen_divisions=12,
+        points_per_div=50,       # 600 total screen points
+        half_screen_divs=6,
+        max_channels=4,          # DS1000Z series is always 4-channel
+    ),
+    ScopeFamily.DHO800: ScopeProfile(
+        family=ScopeFamily.DHO800,
+        screen_divisions=10,
+        points_per_div=100,      # 1000 total screen points
+        half_screen_divs=5,
+        max_channels=4,          # default; refined by _detect_channels()
+    ),
+}
+
+
+def _detect_family(idn_string: str) -> ScopeFamily:
+    """Determine the scope family from the *IDN? response."""
+    model = idn_string.upper()
+    if "DHO" in model:
+        return ScopeFamily.DHO800
+    # Default to DS1000Z for DS/MSO models and unknown instruments
+    return ScopeFamily.DS1000Z
+
+
+def _detect_channels(idn_string: str, family: ScopeFamily) -> int:
+    """Determine the number of analog channels from the model string.
+
+    DHO802/DHO812 have 2 channels; all others have 4.
+    DS1000Z/MSO1000Z series are always 4-channel.
+    """
+    if family == ScopeFamily.DHO800:
+        # Model string is the second CSV field: "RIGOL TECHNOLOGIES,DHO804,..."
+        parts = idn_string.split(",")
+        if len(parts) >= 2:
+            model = parts[1].strip().upper()
+            # DHO802, DHO812 → 2 channels; DHO804, DHO814, DHO824, DHO9xx → 4
+            if model.endswith("02") or model.endswith("12"):
+                return 2
+    return 4
+
+
+# ---------------------------------------------------------------------------
+# Module-level cached connection + detected profile
+# ---------------------------------------------------------------------------
+
 _rm: pyvisa.ResourceManager | None = None
 _scope: pyvisa.resources.Resource | None = None
+_profile: ScopeProfile | None = None
 
 
 def get_resource_string() -> str:
@@ -22,8 +95,12 @@ def get_resource_string() -> str:
 
 
 def get_scope() -> pyvisa.resources.Resource:
-    """Return cached VISA connection, opening it if needed."""
-    global _rm, _scope
+    """Return cached VISA connection, opening it if needed.
+
+    On first connect the scope is queried with *IDN? and the model family
+    is detected automatically (DS1000Z vs DHO800/DHO900).
+    """
+    global _rm, _scope, _profile
     if _scope is None:
         _rm = pyvisa.ResourceManager()
         _scope = _rm.open_resource(get_resource_string())
@@ -32,22 +109,47 @@ def get_scope() -> pyvisa.resources.Resource:
         _scope.write_termination = "\n"
         _scope.read_termination = "\n"
         _scope.clear()  # flush any stale data left in the TCP receive buffer
+        # Detect model family and channel count
+        idn_resp = _scope.query("*IDN?").strip()
+        family = _detect_family(idn_resp)
+        base = _PROFILES[family]
+        n_ch = _detect_channels(idn_resp, family)
+        if n_ch != base.max_channels:
+            # Create a refined profile with the correct channel count
+            _profile = ScopeProfile(
+                family=base.family,
+                screen_divisions=base.screen_divisions,
+                points_per_div=base.points_per_div,
+                half_screen_divs=base.half_screen_divs,
+                max_channels=n_ch,
+            )
+        else:
+            _profile = base
     return _scope
+
+
+def get_profile() -> ScopeProfile:
+    """Return the detected scope profile. Raises if not yet connected."""
+    if _profile is None:
+        raise RuntimeError("Scope not connected — call get_scope() first")
+    return _profile
+
+
+def get_family() -> ScopeFamily:
+    """Return the detected scope family. Raises if not yet connected."""
+    return get_profile().family
 
 
 def invalidate_scope() -> None:
     """Close and discard the cached connection so the next call reconnects."""
-    global _scope
+    global _scope, _profile
     if _scope is not None:
-        try:
+        with contextlib.suppress(Exception):
             _scope.clear()
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             _scope.close()
-        except Exception:
-            pass
         _scope = None
+        _profile = None
 
 
 def check_scpi_error(scope: pyvisa.resources.Resource) -> str | None:
@@ -60,22 +162,25 @@ def check_scpi_error(scope: pyvisa.resources.Resource) -> str | None:
 
 
 def screen_x_to_time(scope: pyvisa.resources.Resource, screen_x: int) -> float:
-    """Convert a screen X pixel position back to time in seconds."""
+    """Convert a screen X pixel position back to time in seconds (DS1000Z only)."""
+    prof = get_profile()
     scale = float(scope.query(":TIM:SCAL?").strip())
     offset = float(scope.query(":TIM:OFFS?").strip())
-    return (screen_x - _SCREEN_CENTER) * scale / _POINTS_PER_DIV + offset
+    return (screen_x - prof.screen_center) * scale / prof.points_per_div + offset
 
 
 def time_to_screen_x(scope: pyvisa.resources.Resource, time_s: float) -> int:
-    """Convert a time value (seconds) to a screen X position integer for cursor commands.
+    """Convert a time value (seconds) to a screen X position integer (DS1000Z only).
 
     Formula derived from DS1000Z geometry (50 pts/div, 12 div, 600 total):
         screen_x = (time - offset) * points_per_div / scale + screen_center
     """
+    prof = get_profile()
     scale = float(scope.query(":TIM:SCAL?").strip())
     offset = float(scope.query(":TIM:OFFS?").strip())
-    screen_x = int(round((time_s - offset) * _POINTS_PER_DIV / scale + _SCREEN_CENTER))
-    return max(5, min(594, screen_x))  # DS1000Z cursor range per manual: 5–594
+    screen_x = int(round((time_s - offset) * prof.points_per_div / scale + prof.screen_center))
+    max_px = prof.screen_points - 6  # DS1000Z cursor range: 5–594
+    return max(5, min(max_px, screen_x))
 
 
 def get_cursor_mode(scope: pyvisa.resources.Resource) -> str:
@@ -96,51 +201,97 @@ def set_cursor_positions(
     bx: float | None = None,
 ) -> None:
     """Set cursor A and/or B X positions (in seconds). mode: MANUAL or TRACK.
-    Time values are automatically converted to screen pixel positions."""
-    prefix = ":CURSor:TRACk" if mode.upper() in ("TRACK", "TRAC") else ":CURSor:MANual"
-    if ax is not None:
-        screen_x = time_to_screen_x(scope, ax)
-        scope.write(f"{prefix}:AX {screen_x}")
-        if err := check_scpi_error(scope):
-            raise RuntimeError(f"SCPI error after {prefix}:AX: {err}")
-    if bx is not None:
-        screen_x = time_to_screen_x(scope, bx)
-        scope.write(f"{prefix}:BX {screen_x}")
-        if err := check_scpi_error(scope):
-            raise RuntimeError(f"SCPI error after {prefix}:BX: {err}")
+
+    DS1000Z: time values are converted to screen pixel positions.
+    DHO800:  time values are sent directly in seconds.
+    """
+    family = get_family()
+    is_track = mode.upper() in ("TRACK", "TRAC")
+
+    if family == ScopeFamily.DHO800:
+        # DHO800 accepts cursor positions directly in seconds
+        prefix = ":CURSor:TRACk" if is_track else ":CURSor:MANual"
+        if not is_track:
+            scope.write(f"{prefix}:TYPE TIME")
+        if ax is not None:
+            scope.write(f"{prefix}:CAX {ax}")
+            if err := check_scpi_error(scope):
+                raise RuntimeError(f"SCPI error after {prefix}:CAX: {err}")
+        if bx is not None:
+            scope.write(f"{prefix}:CBX {bx}")
+            if err := check_scpi_error(scope):
+                raise RuntimeError(f"SCPI error after {prefix}:CBX: {err}")
+    else:
+        # DS1000Z uses pixel positions
+        prefix = ":CURSor:TRACk" if is_track else ":CURSor:MANual"
+        if ax is not None:
+            screen_x = time_to_screen_x(scope, ax)
+            scope.write(f"{prefix}:AX {screen_x}")
+            if err := check_scpi_error(scope):
+                raise RuntimeError(f"SCPI error after {prefix}:AX: {err}")
+        if bx is not None:
+            screen_x = time_to_screen_x(scope, bx)
+            scope.write(f"{prefix}:BX {screen_x}")
+            if err := check_scpi_error(scope):
+                raise RuntimeError(f"SCPI error after {prefix}:BX: {err}")
 
 
 def get_cursor_values(scope: pyvisa.resources.Resource) -> dict:
     """Read current cursor mode and all available readouts. AX_s/BX_s are in seconds."""
+    family = get_family()
     mode = scope.query(":CURSor:MODE?").strip()
     result: dict = {"mode": mode}
+
     if mode in ("MANUAL", "MAN"):
         p = ":CURSor:MANual"
-        ax_px = int(float(scope.query(f"{p}:AX?").strip()))
-        bx_px = int(float(scope.query(f"{p}:BX?").strip()))
-        result.update({
-            "AX_s":        screen_x_to_time(scope, ax_px),
-            "BX_s":        screen_x_to_time(scope, bx_px),
-            "AX_value":    scope.query(f"{p}:AXValue?").strip(),
-            "BX_value":    scope.query(f"{p}:BXValue?").strip(),
-            "delta_x":     scope.query(f"{p}:XDELta?").strip(),
-            "inv_delta_x": scope.query(f"{p}:IXDELta?").strip(),
-        })
+        if family == ScopeFamily.DHO800:
+            result.update({
+                "AX_s":        float(scope.query(f"{p}:CAX?").strip()),
+                "BX_s":        float(scope.query(f"{p}:CBX?").strip()),
+                "AX_value":    scope.query(f"{p}:AXValue?").strip(),
+                "BX_value":    scope.query(f"{p}:BXValue?").strip(),
+                "delta_x":     scope.query(f"{p}:XDELta?").strip(),
+                "inv_delta_x": scope.query(f"{p}:IXDELta?").strip(),
+            })
+        else:
+            ax_px = int(float(scope.query(f"{p}:AX?").strip()))
+            bx_px = int(float(scope.query(f"{p}:BX?").strip()))
+            result.update({
+                "AX_s":        screen_x_to_time(scope, ax_px),
+                "BX_s":        screen_x_to_time(scope, bx_px),
+                "AX_value":    scope.query(f"{p}:AXValue?").strip(),
+                "BX_value":    scope.query(f"{p}:BXValue?").strip(),
+                "delta_x":     scope.query(f"{p}:XDELta?").strip(),
+                "inv_delta_x": scope.query(f"{p}:IXDELta?").strip(),
+            })
     elif mode in ("TRACK", "TRAC"):
         p = ":CURSor:TRACk"
-        ax_px = int(float(scope.query(f"{p}:AX?").strip()))
-        bx_px = int(float(scope.query(f"{p}:BX?").strip()))
-        result.update({
-            "AX_s":        screen_x_to_time(scope, ax_px),
-            "BX_s":        screen_x_to_time(scope, bx_px),
-            "AX_value":    scope.query(f"{p}:AXValue?").strip(),
-            "AY_value":    scope.query(f"{p}:AYValue?").strip(),
-            "BX_value":    scope.query(f"{p}:BXValue?").strip(),
-            "BY_value":    scope.query(f"{p}:BYValue?").strip(),
-            "delta_x":     scope.query(f"{p}:XDELta?").strip(),
-            "delta_y":     scope.query(f"{p}:YDELta?").strip(),
-            "inv_delta_x": scope.query(f"{p}:IXDELta?").strip(),
-        })
+        if family == ScopeFamily.DHO800:
+            result.update({
+                "AX_s":        float(scope.query(f"{p}:CAX?").strip()),
+                "BX_s":        float(scope.query(f"{p}:CBX?").strip()),
+                "AX_value":    scope.query(f"{p}:AXValue?").strip(),
+                "AY_value":    scope.query(f"{p}:AYValue?").strip(),
+                "BX_value":    scope.query(f"{p}:BXValue?").strip(),
+                "BY_value":    scope.query(f"{p}:BYValue?").strip(),
+                "delta_x":     scope.query(f"{p}:XDELta?").strip(),
+                "delta_y":     scope.query(f"{p}:YDELta?").strip(),
+                "inv_delta_x": scope.query(f"{p}:IXDELta?").strip(),
+            })
+        else:
+            ax_px = int(float(scope.query(f"{p}:AX?").strip()))
+            bx_px = int(float(scope.query(f"{p}:BX?").strip()))
+            result.update({
+                "AX_s":        screen_x_to_time(scope, ax_px),
+                "BX_s":        screen_x_to_time(scope, bx_px),
+                "AX_value":    scope.query(f"{p}:AXValue?").strip(),
+                "AY_value":    scope.query(f"{p}:AYValue?").strip(),
+                "BX_value":    scope.query(f"{p}:BXValue?").strip(),
+                "BY_value":    scope.query(f"{p}:BYValue?").strip(),
+                "delta_x":     scope.query(f"{p}:XDELta?").strip(),
+                "delta_y":     scope.query(f"{p}:YDELta?").strip(),
+                "inv_delta_x": scope.query(f"{p}:IXDELta?").strip(),
+            })
     return result
 
 
@@ -180,10 +331,14 @@ def single(scope: pyvisa.resources.Resource) -> str:
 
 
 def autoscale(scope: pyvisa.resources.Resource) -> None:
-    """Run the scope's auto-setup (timebase, vertical scale, trigger)."""
-    scope.query(":AUToscale;*OPC?")  # chain OPC? so we block until autoscale completes
+    """Run the scope's auto-setup (timebase, vertical scale, trigger).
+
+    DS1000Z uses :AUToscale, DHO800 uses :AUToset.
+    """
+    cmd = ":AUToset" if get_family() == ScopeFamily.DHO800 else ":AUToscale"
+    scope.query(f"{cmd};*OPC?")  # chain OPC? so we block until complete
     if err := check_scpi_error(scope):
-        raise RuntimeError(f"SCPI error after :AUToscale: {err}")
+        raise RuntimeError(f"SCPI error after {cmd}: {err}")
 
 
 def idn(scope: pyvisa.resources.Resource) -> str:
@@ -191,7 +346,7 @@ def idn(scope: pyvisa.resources.Resource) -> str:
     return scope.query("*IDN?").strip()
 
 
-# All measurement items supported by DS1000Z :MEASure:ITEM
+# Single-source measurement items — shared across all families
 MEASURE_ITEMS = frozenset({
     # Voltage
     "VMAX", "VMIN", "VPP", "VTOP", "VBASE", "VAMP", "VAVG", "VRMS",
@@ -204,10 +359,26 @@ MEASURE_ITEMS = frozenset({
     "PPULSES", "NPULSES", "PEDGES", "NEDGES",
 })
 
-# Two-source measurements — require both source1 and source2
-MEASURE_ITEMS_TWO_SOURCE = frozenset({
+# Two-source measurements — require both source1 and source2.
+# DS1000Z names: RDELAY, FDELAY, RPHASE, FPHASE
+# DHO800 names:  RRDELAY, FFDELAY, RRPHASE, FFPHASE  (+ cross-edge: RFDELAY, FRDELAY, RFPHASE, FRPHASE)
+# We accept both sets and translate internally.
+MEASURE_ITEMS_TWO_SOURCE_DS1000Z = frozenset({
     "RDELAY", "FDELAY", "RPHASE", "FPHASE",
 })
+
+MEASURE_ITEMS_TWO_SOURCE_DHO800 = frozenset({
+    "RRDELAY", "FFDELAY", "RRPHASE", "FFPHASE",
+    "RFDELAY", "FRDELAY", "RFPHASE", "FRPHASE",
+})
+
+# Mapping from DS1000Z names → DHO800 equivalents (for user convenience)
+_TWO_SOURCE_DS_TO_DHO: dict[str, str] = {
+    "RDELAY": "RRDELAY", "FDELAY": "FFDELAY",
+    "RPHASE": "RRPHASE", "FPHASE": "FFPHASE",
+}
+
+MEASURE_ITEMS_TWO_SOURCE = MEASURE_ITEMS_TWO_SOURCE_DS1000Z | MEASURE_ITEMS_TWO_SOURCE_DHO800
 
 
 def measure(scope: pyvisa.resources.Resource, channel: str, item: str) -> str:
@@ -230,8 +401,10 @@ def measure_between(
 ) -> str:
     """Query a two-source measurement (delay or phase) between two channels.
 
-    item: RDELAY (rising-edge delay), FDELAY (falling-edge delay),
-          RPHASE (rising-edge phase), FPHASE (falling-edge phase).
+    Accepts both DS1000Z names (RDELAY, FDELAY, RPHASE, FPHASE) and
+    DHO800 names (RRDELAY, FFDELAY, RRPHASE, FFPHASE, plus cross-edge
+    variants RFDELAY, FRDELAY, RFPHASE, FRPHASE).
+
     source1/source2: CHAN1–CHAN4.
     Returns the raw value string (delay in seconds, phase in degrees).
     """
@@ -240,6 +413,21 @@ def measure_between(
         raise ValueError(
             f"'{item}' is not a two-source item. Valid: {sorted(MEASURE_ITEMS_TWO_SOURCE)}"
         )
+
+    # Translate item name if needed for the connected scope family
+    family = get_family()
+    if family == ScopeFamily.DHO800 and it in _TWO_SOURCE_DS_TO_DHO:
+        it = _TWO_SOURCE_DS_TO_DHO[it]
+    elif family == ScopeFamily.DS1000Z and it in MEASURE_ITEMS_TWO_SOURCE_DHO800:
+        # Reverse lookup: DHO800 name used with DS1000Z scope
+        reverse = {v: k for k, v in _TWO_SOURCE_DS_TO_DHO.items()}
+        if it in reverse:
+            it = reverse[it]
+        else:
+            raise ValueError(
+                f"'{item}' is a DHO800-only item and not supported on DS1000Z"
+            )
+
     s1 = source1.upper()
     s2 = source2.upper()
     scope.write(f":MEASure:ITEM {it},{s1},{s2}")
@@ -248,7 +436,12 @@ def measure_between(
 
 def get_scope_state(scope: pyvisa.resources.Resource) -> dict:
     """Return a snapshot of the scope's current configuration."""
-    state: dict = {}
+    prof = get_profile()
+    state: dict = {
+        "scope_family": prof.family.value,
+        "analog_channels": prof.max_channels,
+        "half_screen_divs": prof.half_screen_divs,
+    }
 
     state["timebase"] = {
         "scale_s_div": scope.query(":TIM:SCAL?").strip(),
@@ -257,7 +450,7 @@ def get_scope_state(scope: pyvisa.resources.Resource) -> dict:
     }
 
     state["channels"] = {}
-    for i in range(1, 5):
+    for i in range(1, prof.max_channels + 1):
         ch = f"CHAN{i}"
         state["channels"][ch] = {
             "display":    scope.query(f":{ch}:DISP?").strip(),
@@ -382,10 +575,15 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
 def screenshot_png(scope: pyvisa.resources.Resource) -> bytes:
     """Return raw PNG bytes from the scope display.
 
-    Requests PNG directly from the scope (DS1000Z supports BMP24/BMP8/PNG/JPEG/TIFF).
+    DS1000Z: :DISPlay:DATA? ON,OFF,PNG  (ON/OFF control header/footer elements)
+    DHO800:  :DISPlay:DATA? PNG          (no element control parameters)
+
     Strips the IEEE 488.2 TMC block header (#NXXXXXXXXX) and trailing \\n.
     """
-    scope.write(":DISPlay:DATA? ON,OFF,PNG")
+    if get_family() == ScopeFamily.DHO800:
+        scope.write(":DISPlay:DATA? PNG")
+    else:
+        scope.write(":DISPlay:DATA? ON,OFF,PNG")
     # Read the TMC block header: #<n><length_digits><data>
     # Must read by exact byte count — read_raw() stops at 0x0A which appears in PNG data
     prefix = scope.read_bytes(2)  # '#' + digit-count byte

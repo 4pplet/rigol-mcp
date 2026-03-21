@@ -1,6 +1,6 @@
 # rigol-mcp
 
-MCP server for controlling a **Rigol DS1000Z series oscilloscope** over LAN. Exposes the scope as a set of tools that Claude (or any MCP client) can call to take measurements, configure the instrument, and capture screenshots — entirely through natural language.
+MCP server for controlling **Rigol oscilloscopes** over LAN. Exposes the scope as a set of tools that Claude (or any MCP client) can call to take measurements, configure the instrument, and capture screenshots — entirely through natural language.
 
 ![Scope](media/example.png)
 
@@ -19,13 +19,28 @@ MCP server for controlling a **Rigol DS1000Z series oscilloscope** over LAN. Exp
 | MSO1074Z | 4 analog + 16 digital | |
 | MSO1104Z | 4 analog + 16 digital | |
 
+**Rigol DHO800 / DHO900 series:**
+
+| Model | Channels | Notes |
+|---|---|---|
+| DHO802 | 2 analog | 70 MHz |
+| DHO804 | 4 analog | 70 MHz |
+| DHO812 | 2 analog | 100 MHz |
+| DHO814 | 4 analog | 100 MHz |
+| DHO914 | 4 analog | 125 MHz |
+| DHO914S | 4 analog + signal gen | 125 MHz |
+| DHO924 | 4 analog | 250 MHz |
+| DHO924S | 4 analog + signal gen | 250 MHz |
+
+The scope family is **detected automatically** from the `*IDN?` response at connection time. All model-specific differences (screen geometry, command variants) are handled transparently.
+
 The scope must be connected to your **local network via Ethernet** (rear panel RJ45). Wi-Fi is not supported by this hardware. USB-VISA is not currently supported — LAN only.
 
 ## Requirements
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- Rigol DS1000Z on the same LAN as your computer
+- Rigol DS1000Z / MSO1000Z or DHO800 / DHO900 on the same LAN as your computer
 - SCPI over TCP/IP enabled on the scope (it is by default)
 
 ## Installation
@@ -174,9 +189,9 @@ Claude / MCP client
         │  MCP protocol (stdio)
 rigol_mcp.server      ← tool definitions, request routing
         │  Python function calls
-rigol_mcp.scope       ← VISA connection, SCPI command helpers
+rigol_mcp.scope       ← VISA connection, SCPI command helpers, model detection
         │  SCPI over TCP/IP (port 5555)
-Rigol DS1000Z         ← 192.168.1.123
+Rigol scope           ← DS1000Z / DHO800 at 192.168.1.123
 ```
 
 The VISA connection is cached across tool calls (one TCP connection per server session) and reconnects automatically on network errors.
