@@ -18,6 +18,7 @@ from rigol_mcp.scope import (
     _detect_awg,
     _detect_channels,
     _detect_family,
+    _parse_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,32 @@ class TestDetectFamily:
         """Detection should work regardless of case."""
         assert _detect_family("rigol technologies,dho804,serial,fw") == ScopeFamily.DHO800
         assert _detect_family("Rigol Technologies,Dho914S,serial,fw") == ScopeFamily.DHO800
+
+
+# ---------------------------------------------------------------------------
+# Model string parsing
+# ---------------------------------------------------------------------------
+
+class TestParseModel:
+    """Test _parse_model() extracts model from *IDN? response."""
+
+    def test_standard_format(self) -> None:
+        assert _parse_model("RIGOL TECHNOLOGIES,DHO804,serial,fw") == "DHO804"
+
+    def test_ds1000z(self) -> None:
+        assert _parse_model("RIGOL TECHNOLOGIES,DS1054Z,DS1ZA123,00.04.04") == "DS1054Z"
+
+    def test_with_suffix(self) -> None:
+        assert _parse_model("RIGOL TECHNOLOGIES,DS1074Z-S,serial,fw") == "DS1074Z-S"
+
+    def test_empty_string(self) -> None:
+        assert _parse_model("") == ""
+
+    def test_no_commas(self) -> None:
+        assert _parse_model("UNKNOWN") == ""
+
+    def test_whitespace_stripped(self) -> None:
+        assert _parse_model("RIGOL, DHO804 ,serial,fw") == "DHO804"
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +296,53 @@ class TestMeasurementItems:
 
 
 # ---------------------------------------------------------------------------
+# measure_between translation
+# ---------------------------------------------------------------------------
+
+class TestMeasureBetweenTranslation:
+    """Test that measure_between translates item names between families."""
+
+    @patch("rigol_mcp.scope._profile", _PROFILES[ScopeFamily.DHO800])
+    def test_ds_name_translated_to_dho(self) -> None:
+        """DS1000Z name 'RDELAY' should be sent as 'RRDELAY' on DHO800."""
+        from rigol_mcp.scope import measure_between
+        scope = MagicMock()
+        scope.query.return_value = "1.234e-6"
+        measure_between(scope, "CHAN1", "CHAN2", "RDELAY")
+        # The SCPI command should use the translated name
+        write_calls = [str(c) for c in scope.write.call_args_list]
+        assert any("RRDELAY" in c for c in write_calls)
+
+    @patch("rigol_mcp.scope._profile", _PROFILES[ScopeFamily.DS1000Z])
+    def test_dho_name_reverse_translated_to_ds(self) -> None:
+        """DHO800 name 'RRDELAY' should be sent as 'RDELAY' on DS1000Z."""
+        from rigol_mcp.scope import measure_between
+        scope = MagicMock()
+        scope.query.return_value = "1.234e-6"
+        measure_between(scope, "CHAN1", "CHAN2", "RRDELAY")
+        write_calls = [str(c) for c in scope.write.call_args_list]
+        assert any("RDELAY" in c for c in write_calls)
+
+    @patch("rigol_mcp.scope._profile", _PROFILES[ScopeFamily.DS1000Z])
+    def test_dho_only_item_rejected_on_ds1000z(self) -> None:
+        """DHO800-only cross-edge items should be rejected on DS1000Z."""
+        from rigol_mcp.scope import measure_between
+        scope = MagicMock()
+        with pytest.raises(ValueError, match="DHO800-only"):
+            measure_between(scope, "CHAN1", "CHAN2", "RFDELAY")
+
+    @patch("rigol_mcp.scope._profile", _PROFILES[ScopeFamily.DHO800])
+    def test_native_dho_name_unchanged(self) -> None:
+        """DHO800-native name should be sent as-is on DHO800."""
+        from rigol_mcp.scope import measure_between
+        scope = MagicMock()
+        scope.query.return_value = "1.234e-6"
+        measure_between(scope, "CHAN1", "CHAN2", "RFDELAY")
+        write_calls = [str(c) for c in scope.write.call_args_list]
+        assert any("RFDELAY" in c for c in write_calls)
+
+
+# ---------------------------------------------------------------------------
 # Autoscale command selection
 # ---------------------------------------------------------------------------
 
@@ -422,3 +496,37 @@ class TestSignalGenerator:
     def test_max_source_channels(self) -> None:
         assert _MAX_SOURCE_CHANNELS[ScopeFamily.DS1000Z] == 2
         assert _MAX_SOURCE_CHANNELS[ScopeFamily.DHO800] == 1
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_check_awg_rejects_source_zero(self) -> None:
+        from rigol_mcp.scope import _check_awg
+        with pytest.raises(ValueError, match="out of range"):
+            _check_awg(0)
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_set_source_offset_and_duty_cycle(self) -> None:
+        """Verify offset, duty_cycle, and impedance params are sent."""
+        from rigol_mcp.scope import set_source
+        scope = MagicMock()
+        with patch("rigol_mcp.scope.check_scpi_error", return_value=None):
+            set_source(scope, offset=0.5, duty_cycle=25.0, impedance="FIFT")
+        calls = [str(c) for c in scope.write.call_args_list]
+        assert any(":SOURce1:VOLTage:OFFSet 0.5" in c for c in calls)
+        assert any(":SOURce1:PULSe:DCYCle 25.0" in c for c in calls)
+        assert any(":SOURce1:OUTPut:IMPedance FIFT" in c for c in calls)
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_get_source_state_queries(self) -> None:
+        """Verify get_source_state queries the right SCPI commands."""
+        from rigol_mcp.scope import get_source_state
+        scope = MagicMock()
+        scope.query.return_value = "SIN\n"
+        state = get_source_state(scope, source=1)
+        query_calls = [str(c) for c in scope.query.call_args_list]
+        assert any(":SOURce1:OUTPut?" in c for c in query_calls)
+        assert any(":SOURce1:FUNCtion?" in c for c in query_calls)
+        assert any(":SOURce1:FREQuency?" in c for c in query_calls)
+        assert any(":SOURce1:VOLTage?" in c for c in query_calls)
+        assert any(":SOURce1:VOLTage:OFFSet?" in c for c in query_calls)
+        assert any(":SOURce1:OUTPut:IMPedance?" in c for c in query_calls)
+        assert state["source"] == 1

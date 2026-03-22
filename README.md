@@ -192,6 +192,9 @@ Available on -S models (DS1074Z-S, DS1104Z-S, DHO914S, DHO924S) and scopes with 
 **Unknown signal characterisation:**
 > "There's an unfamiliar signal on channel 1. I don't know its frequency, amplitude, or shape. Keep adjusting the timebase and vertical scale until you have a stable, well-framed view of at least two full cycles, then give me a complete characterisation of what you see."
 
+**Signal generator (requires -S model or AWG mod):**
+> "Set the signal generator to output a 10 kHz sine wave at 1 Vpp, then enable the output."
+
 ## Architecture
 
 ```
