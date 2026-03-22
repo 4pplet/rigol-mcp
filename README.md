@@ -213,8 +213,16 @@ The VISA connection is cached across tool calls (one TCP connection per server s
 
 The server connects using **raw socket VISA** (`TCPIP0::<ip>::5555::SOCKET`), not VXI-11. This avoids the NI-VISA dependency and works with the pure-Python `pyvisa-py` backend. It also eliminates the VXI-11 handshake overhead, making individual commands faster.
 
-## Limitations
+## Limitations & Future Work
 
-- LAN only (no USB) - USB just adds more problems and OS-specific implementation challenges!
-- No support for math channels, digital channels (MSO), or protocol decode in the current tools yet — use `send_raw` for those
-- Waveform download uses NORMAL mode (screen buffer, ~1200 points); full memory depth (RAW mode, up to 56M points) is not yet implemented
+**Current limitations** (use `send_raw` as an escape hatch for any of these):
+
+- **LAN only** — no USB. USB adds OS-specific driver complexity with no benefit over LAN
+- **Edge trigger only** — pulse width, pattern, video, and protocol triggers are not exposed as dedicated tools
+- **NORMAL mode waveform only** — screen buffer (~600 pts DS1000Z, ~1000 pts DHO800). Full memory depth RAW mode (up to 56M points) is not yet implemented
+- **No acquisition type control** — cannot set AVERAGE, PEAK, or ULTRA modes (useful for noise reduction)
+- **No memory depth control** — cannot query or set acquisition memory depth
+- **No math channels** — math waveform display/capture not exposed
+- **No digital channels (MSO/LA)** — MSO1000Z digital channels and future DHO800 logic analyzer mods not supported
+- **No protocol decode** — I2C, SPI, UART, CAN decode triggers/results not exposed
+- **No delayed (zoom) timebase** — zoom window configuration not exposed

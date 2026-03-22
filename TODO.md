@@ -113,6 +113,31 @@ SCPI commands — they activate when the scope identifies as a `-S` model.
   - `:SOURce1:OUTPut:IMPedance` — OMEG (high-Z) or FIFT (50 ohm)
 - [x] **7.5** DS1000Z-S has 2 source channels (`:SOURce1:`, `:SOURce2:`), DHO900S has 1 — handled via `_MAX_SOURCE_CHANNELS`
 
+### Phase 8: Future enhancements
+
+Features not yet exposed as dedicated tools (accessible via `send_raw` escape hatch):
+
+- [ ] **8.1** Deep waveform capture (RAW/WORD mode with chunked download, full memory depth)
+  - `:WAV:MODE RAW`, `:WAV:FORM WORD`, `:WAV:STAR`/`:WAV:STOP` for chunking
+  - Potentially millions of points — needs progress reporting
+- [ ] **8.2** Acquisition type control: `:ACQ:TYPE` (NORMAL, AVERAGE, PEAK, ULTRA)
+  - AVERAGE mode is especially useful for noise reduction
+- [ ] **8.3** Memory depth control: `:ACQ:MDEP` query and set
+- [ ] **8.4** Digital channels / logic analyzer (MSO)
+  - MSO1000Z: 16 digital channels via `:DIGital:CHANn:DISPlay`, `:DIGital:THReshold`
+  - DHO800: no built-in digital channels, but community aftermarket LA boards may appear
+  - DHO900: has digital channel support built in
+  - Would need: channel enable/disable, threshold configuration, waveform download for digital channels
+  - SCPI: `:LA:DIGital<n>:DISPlay`, `:LA:THReshold`, `:WAV:SOUR D<n>`
+- [ ] **8.5** Protocol decode: `:DECoder` commands for I2C, SPI, UART, CAN, LIN
+  - Configure bus decode, read decoded data
+- [ ] **8.6** Additional trigger modes: pulse width, pattern, video, slope, timeout
+  - `:TRIGger:MODE PULSe`, `:TRIGger:PULSe:*` commands
+- [ ] **8.7** Math channels: `:MATH:DISPlay`, `:MATH:OPERator`, `:MATH:SOURce`
+- [ ] **8.8** Delayed (zoom) timebase: `:TIM:DEL:ENAB`, `:TIM:DEL:SCAL`, `:TIM:DEL:OFFS`
+- [ ] **8.9** DVM (digital voltmeter): `:DVM:ENABle`, `:DVM:SOURce`, `:DVM:CURRent?`
+- [ ] **8.10** Hardware counter: frequency/period/totalize with statistics
+
 ---
 
 ## SCPI Command Reference (differences only)
