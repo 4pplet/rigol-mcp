@@ -5,13 +5,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from rigol_mcp.scope import (
+    _MAX_SOURCE_CHANNELS,
     _PROFILES,
     _TWO_SOURCE_DS_TO_DHO,
     MEASURE_ITEMS,
     MEASURE_ITEMS_TWO_SOURCE,
     MEASURE_ITEMS_TWO_SOURCE_DHO800,
     MEASURE_ITEMS_TWO_SOURCE_DS1000Z,
+    SOURCE_WAVEFORMS,
     ScopeFamily,
+    ScopeProfile,
     _detect_awg,
     _detect_channels,
     _detect_family,
@@ -313,3 +316,109 @@ class TestScreenshotCommand:
         scope.read_bytes.side_effect = [b"#9", b"000000010", b"\x89PNG" + b"\x00" * 6]
         screenshot_png(scope)
         scope.write.assert_called_once_with(":DISPlay:DATA? PNG")
+
+
+# ---------------------------------------------------------------------------
+# Signal generator (AWG)
+# ---------------------------------------------------------------------------
+
+# Helper profiles with AWG enabled
+_DHO924S_PROFILE = ScopeProfile(
+    family=ScopeFamily.DHO800,
+    screen_divisions=10, points_per_div=100, half_screen_divs=5,
+    max_channels=4, has_awg=True, model="DHO924S",
+)
+_DS1074ZS_PROFILE = ScopeProfile(
+    family=ScopeFamily.DS1000Z,
+    screen_divisions=12, points_per_div=50, half_screen_divs=6,
+    max_channels=4, has_awg=True, model="DS1074Z-S",
+)
+_NO_AWG_PROFILE = ScopeProfile(
+    family=ScopeFamily.DHO800,
+    screen_divisions=10, points_per_div=100, half_screen_divs=5,
+    max_channels=4, has_awg=False, model="DHO804",
+)
+
+
+class TestSignalGenerator:
+    """Test signal generator guard and SCPI commands."""
+
+    @patch("rigol_mcp.scope._profile", _NO_AWG_PROFILE)
+    def test_check_awg_raises_without_awg(self) -> None:
+        from rigol_mcp.scope import _check_awg
+        with pytest.raises(RuntimeError, match="not available"):
+            _check_awg()
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_check_awg_ok_with_awg(self) -> None:
+        from rigol_mcp.scope import _check_awg
+        assert _check_awg(1) == ":SOURce1"
+
+    @patch("rigol_mcp.scope._profile", _DS1074ZS_PROFILE)
+    def test_ds1000z_s_has_two_sources(self) -> None:
+        from rigol_mcp.scope import _check_awg
+        assert _check_awg(1) == ":SOURce1"
+        assert _check_awg(2) == ":SOURce2"
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_dho900s_rejects_source_2(self) -> None:
+        from rigol_mcp.scope import _check_awg
+        with pytest.raises(ValueError, match="out of range"):
+            _check_awg(2)
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_set_source_sends_commands(self) -> None:
+        from rigol_mcp.scope import set_source
+        scope = MagicMock()
+        with patch("rigol_mcp.scope.check_scpi_error", return_value=None):
+            set_source(scope, source=1, function="SIN", frequency=1000, amplitude=2.0)
+        calls = [str(c) for c in scope.write.call_args_list]
+        assert any(":SOURce1:FUNCtion SIN" in c for c in calls)
+        assert any(":SOURce1:FREQuency 1000" in c for c in calls)
+        assert any(":SOURce1:VOLTage 2.0" in c for c in calls)
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_set_source_rejects_invalid_waveform(self) -> None:
+        from rigol_mcp.scope import set_source
+        scope = MagicMock()
+        with pytest.raises(ValueError, match="Unknown waveform"):
+            set_source(scope, function="TRIANGLE")
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_source_output_on(self) -> None:
+        from rigol_mcp.scope import source_output
+        scope = MagicMock()
+        scope.query.return_value = "ON"
+        with patch("rigol_mcp.scope.check_scpi_error", return_value=None):
+            result = source_output(scope, enable=True)
+        scope.write.assert_called_once_with(":SOURce1:OUTPut ON")
+        assert result == "ON"
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_source_output_off(self) -> None:
+        from rigol_mcp.scope import source_output
+        scope = MagicMock()
+        scope.query.return_value = "OFF"
+        with patch("rigol_mcp.scope.check_scpi_error", return_value=None):
+            result = source_output(scope, enable=False)
+        scope.write.assert_called_once_with(":SOURce1:OUTPut OFF")
+        assert result == "OFF"
+
+    @patch("rigol_mcp.scope._profile", _DS1074ZS_PROFILE)
+    def test_set_source_channel_2(self) -> None:
+        """DS1000Z-S source 2 should use :SOURce2 prefix."""
+        from rigol_mcp.scope import set_source
+        scope = MagicMock()
+        with patch("rigol_mcp.scope.check_scpi_error", return_value=None):
+            set_source(scope, source=2, function="SQU")
+        calls = [str(c) for c in scope.write.call_args_list]
+        assert any(":SOURce2:FUNCtion SQU" in c for c in calls)
+
+    def test_source_waveforms_set(self) -> None:
+        """Verify standard waveform types are in the set."""
+        for wf in ("SIN", "SQU", "RAMP", "PULS", "NOIS", "DC", "ARB"):
+            assert wf in SOURCE_WAVEFORMS
+
+    def test_max_source_channels(self) -> None:
+        assert _MAX_SOURCE_CHANNELS[ScopeFamily.DS1000Z] == 2
+        assert _MAX_SOURCE_CHANNELS[ScopeFamily.DHO800] == 1

@@ -151,6 +151,16 @@ Add to your `.mcp.json` (or Claude Desktop MCP config):
 | `set_cursors` | Set cursor mode (MANUAL/TRACK/OFF) and time positions in seconds |
 | `get_cursor_values` | Read cursor positions (in seconds) and all delta/amplitude readouts |
 
+### Signal Generator (AWG)
+
+Available on -S models (DS1074Z-S, DS1104Z-S, DHO914S, DHO924S) and scopes with the [community AWG daughterboard](https://github.com/MatthiasElectronic/AWG_DHO8-900).
+
+| Tool | Description |
+|---|---|
+| `get_source_state` | Read signal generator config: waveform, frequency, amplitude, offset, output state |
+| `set_source` | Configure waveform type (SIN/SQU/RAMP/PULS/NOIS/DC/ARB), frequency, amplitude, offset, duty cycle, impedance |
+| `source_output` | Enable or disable signal generator output |
+
 ### Utility
 
 | Tool | Description |

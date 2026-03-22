@@ -622,3 +622,101 @@ def screenshot_png(scope: pyvisa.resources.Resource) -> bytes:
     n = int(prefix[1:2])
     data_length = int(scope.read_bytes(n))
     return scope.read_bytes(data_length)
+
+
+# ---------------------------------------------------------------------------
+# Signal generator (AWG) — available on -S models and community AWG mods
+# ---------------------------------------------------------------------------
+
+# Waveform types supported by :SOURce:FUNCtion
+SOURCE_WAVEFORMS = frozenset({
+    "SIN", "SQU", "RAMP", "PULS", "NOIS", "DC", "ARB",
+})
+
+# Max source channels per family: DS1000Z-S has 2, DHO900S has 1
+_MAX_SOURCE_CHANNELS: dict[ScopeFamily, int] = {
+    ScopeFamily.DS1000Z: 2,
+    ScopeFamily.DHO800: 1,
+}
+
+
+def _check_awg(source: int = 1) -> str:
+    """Validate AWG is available and return the :SOURce prefix.
+
+    Raises RuntimeError if the connected scope has no signal generator.
+    """
+    prof = get_profile()
+    if not prof.has_awg:
+        raise RuntimeError(
+            f"Signal generator not available on {prof.model}. "
+            "Requires a -S model (DS1074Z-S, DHO914S, DHO924S, etc.)"
+        )
+    max_ch = _MAX_SOURCE_CHANNELS.get(prof.family, 1)
+    if source < 1 or source > max_ch:
+        raise ValueError(
+            f"Source channel {source} out of range (1–{max_ch} for {prof.model})"
+        )
+    return f":SOURce{source}"
+
+
+def get_source_state(scope: pyvisa.resources.Resource, source: int = 1) -> dict:
+    """Return a snapshot of a signal generator channel's configuration."""
+    p = _check_awg(source)
+    return {
+        "source": source,
+        "output":    scope.query(f"{p}:OUTPut?").strip(),
+        "function":  scope.query(f"{p}:FUNCtion?").strip(),
+        "frequency": scope.query(f"{p}:FREQuency?").strip(),
+        "amplitude": scope.query(f"{p}:VOLTage?").strip(),
+        "offset":    scope.query(f"{p}:VOLTage:OFFSet?").strip(),
+        "impedance": scope.query(f"{p}:OUTPut:IMPedance?").strip(),
+    }
+
+
+def set_source(
+    scope: pyvisa.resources.Resource,
+    source: int = 1,
+    function: str | None = None,
+    frequency: float | None = None,
+    amplitude: float | None = None,
+    offset: float | None = None,
+    duty_cycle: float | None = None,
+    impedance: str | None = None,
+) -> None:
+    """Configure a signal generator channel. Only specified parameters are changed.
+
+    function: SIN, SQU, RAMP, PULS, NOIS, DC, ARB.
+    frequency: Hz. amplitude: Vpp. offset: V. duty_cycle: % (pulse only).
+    impedance: OMEG (high-Z) or FIFT (50 ohm).
+    """
+    p = _check_awg(source)
+    if function is not None:
+        fn = function.upper()
+        if fn not in SOURCE_WAVEFORMS:
+            raise ValueError(f"Unknown waveform '{function}'. Valid: {sorted(SOURCE_WAVEFORMS)}")
+        scope.write(f"{p}:FUNCtion {fn}")
+    if frequency is not None:
+        scope.write(f"{p}:FREQuency {frequency}")
+    if amplitude is not None:
+        scope.write(f"{p}:VOLTage {amplitude}")
+    if offset is not None:
+        scope.write(f"{p}:VOLTage:OFFSet {offset}")
+    if duty_cycle is not None:
+        scope.write(f"{p}:PULSe:DCYCle {duty_cycle}")
+    if impedance is not None:
+        scope.write(f"{p}:OUTPut:IMPedance {impedance.upper()}")
+    if err := check_scpi_error(scope):
+        raise RuntimeError(f"SCPI error in set_source: {err}")
+
+
+def source_output(
+    scope: pyvisa.resources.Resource,
+    enable: bool,
+    source: int = 1,
+) -> str:
+    """Enable or disable a signal generator output. Returns the resulting state."""
+    p = _check_awg(source)
+    scope.write(f"{p}:OUTPut {'ON' if enable else 'OFF'}")
+    if err := check_scpi_error(scope):
+        raise RuntimeError(f"SCPI error after {p}:OUTPut: {err}")
+    return scope.query(f"{p}:OUTPut?").strip()

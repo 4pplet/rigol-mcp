@@ -21,6 +21,7 @@ from rigol_mcp.scope import (
     get_profile,
     get_scope,
     get_scope_state,
+    get_source_state,
     get_waveform,
     idn,
     invalidate_scope,
@@ -32,9 +33,11 @@ from rigol_mcp.scope import (
     set_channel,
     set_cursor_mode,
     set_cursor_positions,
+    set_source,
     set_timebase,
     set_trigger,
     single,
+    source_output,
     stop,
 )
 from rigol_mcp.waveform_analysis import describe_waveform as _describe_waveform
@@ -347,6 +350,102 @@ async def list_tools() -> list[types.Tool]:
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        types.Tool(
+            name="get_source_state",
+            description=(
+                "Return the current configuration of a signal generator channel: "
+                "waveform type, frequency, amplitude, offset, output state, impedance. "
+                "Only available on -S models (DS1074Z-S, DS1104Z-S, DHO914S, DHO924S) "
+                "or scopes with the community AWG daughterboard mod. "
+                "Check has_awg in get_scope_state to verify availability. "
+                "source: 1 (default) or 2 (DS1000Z-S only). "
+                "Do not call concurrently with any other rigol tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "integer",
+                        "description": "Source channel (1 or 2, default 1). DS1000Z-S has 2, DHO900S has 1.",
+                        "default": 1,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="set_source",
+            description=(
+                "Configure a signal generator channel. Only specified parameters are changed. "
+                "function: SIN, SQU, RAMP, PULS, NOIS, DC, ARB. "
+                "frequency: Hz (e.g. 1000 for 1 kHz). "
+                "amplitude: Vpp (e.g. 2.0 for 2 Vpp). "
+                "offset: DC offset in volts. "
+                "duty_cycle: % for pulse waveform (10–90). "
+                "impedance: OMEG (high-Z) or FIFT (50 ohm). "
+                "Only available on -S models or community AWG mod. "
+                "Returns the resulting source configuration. "
+                "Do not call concurrently with any other rigol tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "integer",
+                        "description": "Source channel (default 1)",
+                        "default": 1,
+                    },
+                    "function": {
+                        "type": "string",
+                        "enum": ["SIN", "SQU", "RAMP", "PULS", "NOIS", "DC", "ARB"],
+                        "description": "Waveform type",
+                    },
+                    "frequency": {
+                        "type": ["number", "string"],
+                        "description": "Frequency in Hz",
+                    },
+                    "amplitude": {
+                        "type": ["number", "string"],
+                        "description": "Amplitude in Vpp",
+                    },
+                    "offset": {
+                        "type": ["number", "string"],
+                        "description": "DC offset in volts",
+                    },
+                    "duty_cycle": {
+                        "type": ["number", "string"],
+                        "description": "Duty cycle % (pulse waveform only, 10–90)",
+                    },
+                    "impedance": {
+                        "type": "string",
+                        "enum": ["OMEG", "FIFT"],
+                        "description": "Output impedance: OMEG (high-Z) or FIFT (50 ohm)",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="source_output",
+            description=(
+                "Enable or disable a signal generator output. "
+                "Only available on -S models or community AWG mod. "
+                "Returns the resulting output state. "
+                "Do not call concurrently with any other rigol tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "enable": {"type": "boolean", "description": "True to enable, False to disable"},
+                    "source": {
+                        "type": "integer",
+                        "description": "Source channel (default 1)",
+                        "default": 1,
+                    },
+                },
+                "required": ["enable"],
+            },
+        ),
     ]
 
 
@@ -468,6 +567,38 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
         await _call(autoscale)
         state = await _call(get_scope_state)
         return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
+
+    if name == "get_source_state":
+        src = arguments.get("source", 1)
+        state = await _call(get_source_state, source=int(src))
+        return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
+
+    if name == "set_source":
+        def _f(key: str) -> float | None:
+            v = arguments.get(key)
+            return float(v) if v is not None else None
+
+        await _call(
+            set_source,
+            source=int(arguments.get("source", 1)),
+            function=arguments.get("function"),
+            frequency=_f("frequency"),
+            amplitude=_f("amplitude"),
+            offset=_f("offset"),
+            duty_cycle=_f("duty_cycle"),
+            impedance=arguments.get("impedance"),
+        )
+        src = int(arguments.get("source", 1))
+        state = await _call(get_source_state, source=src)
+        return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
+
+    if name == "source_output":
+        result = await _call(
+            source_output,
+            enable=arguments["enable"],
+            source=int(arguments.get("source", 1)),
+        )
+        return [types.TextContent(type="text", text=f"output: {result}")]
 
     raise ValueError(f"Unknown tool: {name}")
 

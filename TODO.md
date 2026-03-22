@@ -97,21 +97,21 @@ Community mods (MatthiasElectronic AWG daughterboard + vendor.bin hack to DHO914
 make signal generator support a common need. The firmware already contains all `:SOURce1:`
 SCPI commands — they activate when the scope identifies as a `-S` model.
 
-- [ ] **7.1** Detect signal generator capability from `*IDN?` (look for `-S` suffix or `S` in model: DHO914S, DHO924S, DS1074Z-S, DS1104Z-S)
-- [ ] **7.2** Add `ScopeProfile.has_awg: bool` flag
-- [ ] **7.3** Implement signal generator tools:
+- [x] **7.1** Detect signal generator capability from `*IDN?` (look for `-S` suffix or `S` in model: DHO914S, DHO924S, DS1074Z-S, DS1104Z-S)
+- [x] **7.2** Add `ScopeProfile.has_awg: bool` flag
+- [x] **7.3** Implement signal generator tools:
   - `set_source` — configure waveform type, frequency, amplitude, offset, duty cycle
   - `get_source_state` — read current AWG configuration
   - `source_output` — enable/disable output
-- [ ] **7.4** SCPI commands to implement:
-  - `:SOURce1:FUNCtion` — SINusoid, SQUare, RAMP, PULSe, NOISe, DC, ARBitrary
+- [x] **7.4** SCPI commands implemented:
+  - `:SOURce1:FUNCtion` — SIN, SQU, RAMP, PULS, NOIS, DC, ARB
   - `:SOURce1:FREQuency` — output frequency
   - `:SOURce1:VOLTage` — amplitude
   - `:SOURce1:VOLTage:OFFSet` — DC offset
   - `:SOURce1:OUTPut` — on/off
   - `:SOURce1:PULSe:DCYCle` — pulse duty cycle
-  - `:SOURce1:APPLy:<shape>` — quick-apply shortcut
-- [ ] **7.5** DS1000Z-S has 2 source channels (`:SOURce1:`, `:SOURce2:`), DHO900S has 1 — handle accordingly
+  - `:SOURce1:OUTPut:IMPedance` — OMEG (high-Z) or FIFT (50 ohm)
+- [x] **7.5** DS1000Z-S has 2 source channels (`:SOURce1:`, `:SOURce2:`), DHO900S has 1 — handled via `_MAX_SOURCE_CHANNELS`
 
 ---
 
