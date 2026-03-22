@@ -12,6 +12,7 @@ from rigol_mcp.scope import (
     MEASURE_ITEMS_TWO_SOURCE_DHO800,
     MEASURE_ITEMS_TWO_SOURCE_DS1000Z,
     ScopeFamily,
+    _detect_awg,
     _detect_channels,
     _detect_family,
 )
@@ -64,25 +65,64 @@ class TestDetectChannels:
     """Test _detect_channels() for 2-channel vs 4-channel models."""
 
     def test_dho804_is_4ch(self) -> None:
-        assert _detect_channels("RIGOL TECHNOLOGIES,DHO804,serial,fw", ScopeFamily.DHO800) == 4
+        assert _detect_channels("DHO804", ScopeFamily.DHO800) == 4
 
     def test_dho802_is_2ch(self) -> None:
-        assert _detect_channels("RIGOL TECHNOLOGIES,DHO802,serial,fw", ScopeFamily.DHO800) == 2
+        assert _detect_channels("DHO802", ScopeFamily.DHO800) == 2
 
     def test_dho812_is_2ch(self) -> None:
-        assert _detect_channels("RIGOL TECHNOLOGIES,DHO812,serial,fw", ScopeFamily.DHO800) == 2
+        assert _detect_channels("DHO812", ScopeFamily.DHO800) == 2
 
     def test_dho814_is_4ch(self) -> None:
-        assert _detect_channels("RIGOL TECHNOLOGIES,DHO814,serial,fw", ScopeFamily.DHO800) == 4
+        assert _detect_channels("DHO814", ScopeFamily.DHO800) == 4
 
     def test_dho824_is_4ch(self) -> None:
-        assert _detect_channels("RIGOL TECHNOLOGIES,DHO824,serial,fw", ScopeFamily.DHO800) == 4
+        assert _detect_channels("DHO824", ScopeFamily.DHO800) == 4
 
     def test_dho914s_is_4ch(self) -> None:
-        assert _detect_channels("RIGOL TECHNOLOGIES,DHO914S,serial,fw", ScopeFamily.DHO800) == 4
+        assert _detect_channels("DHO914S", ScopeFamily.DHO800) == 4
 
     def test_ds1054z_is_4ch(self) -> None:
-        assert _detect_channels("RIGOL TECHNOLOGIES,DS1054Z,serial,fw", ScopeFamily.DS1000Z) == 4
+        assert _detect_channels("DS1054Z", ScopeFamily.DS1000Z) == 4
+
+
+# ---------------------------------------------------------------------------
+# AWG detection
+# ---------------------------------------------------------------------------
+
+class TestDetectAwg:
+    """Test _detect_awg() for signal generator models."""
+
+    # DHO800/900 with AWG
+    def test_dho914s_has_awg(self) -> None:
+        assert _detect_awg("DHO914S", ScopeFamily.DHO800) is True
+
+    def test_dho924s_has_awg(self) -> None:
+        assert _detect_awg("DHO924S", ScopeFamily.DHO800) is True
+
+    # DHO800/900 without AWG
+    def test_dho804_no_awg(self) -> None:
+        assert _detect_awg("DHO804", ScopeFamily.DHO800) is False
+
+    def test_dho824_no_awg(self) -> None:
+        assert _detect_awg("DHO824", ScopeFamily.DHO800) is False
+
+    def test_dho914_no_awg(self) -> None:
+        assert _detect_awg("DHO914", ScopeFamily.DHO800) is False
+
+    # DS1000Z with AWG
+    def test_ds1074z_s_has_awg(self) -> None:
+        assert _detect_awg("DS1074Z-S", ScopeFamily.DS1000Z) is True
+
+    def test_ds1104z_s_has_awg(self) -> None:
+        assert _detect_awg("DS1104Z-S", ScopeFamily.DS1000Z) is True
+
+    # DS1000Z without AWG
+    def test_ds1054z_no_awg(self) -> None:
+        assert _detect_awg("DS1054Z", ScopeFamily.DS1000Z) is False
+
+    def test_mso1104z_no_awg(self) -> None:
+        assert _detect_awg("MSO1104Z", ScopeFamily.DS1000Z) is False
 
 
 # ---------------------------------------------------------------------------

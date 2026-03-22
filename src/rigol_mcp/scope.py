@@ -24,6 +24,8 @@ class ScopeProfile:
     points_per_div: int
     half_screen_divs: int          # divisions from center to edge
     max_channels: int              # number of analog channels (2 or 4)
+    has_awg: bool = False          # signal generator present (-S models)
+    model: str = ""                # raw model string from *IDN? (e.g. "DHO804")
 
     @property
     def screen_points(self) -> int:
@@ -61,21 +63,44 @@ def _detect_family(idn_string: str) -> ScopeFamily:
     return ScopeFamily.DS1000Z
 
 
-def _detect_channels(idn_string: str, family: ScopeFamily) -> int:
+def _parse_model(idn_string: str) -> str:
+    """Extract the model string from the *IDN? response.
+
+    *IDN? format: 'RIGOL TECHNOLOGIES,<model>,<serial>,<firmware>'
+    Returns the model string (e.g. 'DHO804', 'DS1054Z'), or '' if unparseable.
+    """
+    parts = idn_string.split(",")
+    if len(parts) >= 2:
+        return parts[1].strip()
+    return ""
+
+
+def _detect_channels(model: str, family: ScopeFamily) -> int:
     """Determine the number of analog channels from the model string.
 
     DHO802/DHO812 have 2 channels; all others have 4.
     DS1000Z/MSO1000Z series are always 4-channel.
     """
     if family == ScopeFamily.DHO800:
-        # Model string is the second CSV field: "RIGOL TECHNOLOGIES,DHO804,..."
-        parts = idn_string.split(",")
-        if len(parts) >= 2:
-            model = parts[1].strip().upper()
-            # DHO802, DHO812 → 2 channels; DHO804, DHO814, DHO824, DHO9xx → 4
-            if model.endswith("02") or model.endswith("12"):
-                return 2
+        m = model.upper()
+        # DHO802, DHO812 → 2 channels; DHO804, DHO814, DHO824, DHO9xx → 4
+        if m.endswith("02") or m.endswith("12"):
+            return 2
     return 4
+
+
+def _detect_awg(model: str, family: ScopeFamily) -> bool:
+    """Detect whether the scope has a built-in signal generator.
+
+    DS1000Z: models ending in '-S' (DS1074Z-S, DS1104Z-S)
+    DHO800:  models ending in 'S' (DHO914S, DHO924S)
+    """
+    m = model.upper()
+    if family == ScopeFamily.DS1000Z:
+        return m.endswith("-S") or m.endswith("-S PLUS")
+    if family == ScopeFamily.DHO800:
+        return m.endswith("S") and not m.endswith("SS")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -109,19 +134,22 @@ def get_scope() -> pyvisa.resources.Resource:
         _scope.write_termination = "\n"
         _scope.read_termination = "\n"
         _scope.clear()  # flush any stale data left in the TCP receive buffer
-        # Detect model family and channel count
+        # Detect model family, channel count, and AWG capability
         idn_resp = _scope.query("*IDN?").strip()
         family = _detect_family(idn_resp)
+        model_str = _parse_model(idn_resp)
         base = _PROFILES[family]
-        n_ch = _detect_channels(idn_resp, family)
-        if n_ch != base.max_channels:
-            # Create a refined profile with the correct channel count
+        n_ch = _detect_channels(model_str, family)
+        awg = _detect_awg(model_str, family)
+        if n_ch != base.max_channels or awg or model_str:
             _profile = ScopeProfile(
                 family=base.family,
                 screen_divisions=base.screen_divisions,
                 points_per_div=base.points_per_div,
                 half_screen_divs=base.half_screen_divs,
                 max_channels=n_ch,
+                has_awg=awg,
+                model=model_str,
             )
         else:
             _profile = base
@@ -438,8 +466,10 @@ def get_scope_state(scope: pyvisa.resources.Resource) -> dict:
     """Return a snapshot of the scope's current configuration."""
     prof = get_profile()
     state: dict = {
+        "model": prof.model,
         "scope_family": prof.family.value,
         "analog_channels": prof.max_channels,
+        "has_awg": prof.has_awg,
         "half_screen_divs": prof.half_screen_divs,
     }
 
