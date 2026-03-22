@@ -528,5 +528,17 @@ class TestSignalGenerator:
         assert any(":SOURce1:FREQuency?" in c for c in query_calls)
         assert any(":SOURce1:VOLTage?" in c for c in query_calls)
         assert any(":SOURce1:VOLTage:OFFSet?" in c for c in query_calls)
+        assert any(":SOURce1:PHASe?" in c for c in query_calls)
+        assert any(":SOURce1:PULSe:DCYCle?" in c for c in query_calls)
         assert any(":SOURce1:OUTPut:IMPedance?" in c for c in query_calls)
         assert state["source"] == 1
+
+    @patch("rigol_mcp.scope._profile", _DHO924S_PROFILE)
+    def test_set_source_phase(self) -> None:
+        """Verify phase parameter is sent."""
+        from rigol_mcp.scope import set_source
+        scope = MagicMock()
+        with patch("rigol_mcp.scope.check_scpi_error", return_value=None):
+            set_source(scope, phase=90.0)
+        calls = [str(c) for c in scope.write.call_args_list]
+        assert any(":SOURce1:PHASe 90.0" in c for c in calls)

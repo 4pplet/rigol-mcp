@@ -381,6 +381,7 @@ async def list_tools() -> list[types.Tool]:
                 "frequency: Hz (e.g. 1000 for 1 kHz). "
                 "amplitude: Vpp (e.g. 2.0 for 2 Vpp). "
                 "offset: DC offset in volts. "
+                "phase: start phase in degrees (0–360). "
                 "duty_cycle: % for pulse waveform (10–90). "
                 "impedance: OMEG (high-Z) or FIFT (50 ohm). "
                 "Only available on -S models or community AWG mod. "
@@ -411,6 +412,10 @@ async def list_tools() -> list[types.Tool]:
                     "offset": {
                         "type": ["number", "string"],
                         "description": "DC offset in volts",
+                    },
+                    "phase": {
+                        "type": ["number", "string"],
+                        "description": "Start phase in degrees (0–360)",
                     },
                     "duty_cycle": {
                         "type": ["number", "string"],
@@ -585,6 +590,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             frequency=_f("frequency"),
             amplitude=_f("amplitude"),
             offset=_f("offset"),
+            phase=_f("phase"),
             duty_cycle=_f("duty_cycle"),
             impedance=arguments.get("impedance"),
         )

@@ -663,13 +663,15 @@ def get_source_state(scope: pyvisa.resources.Resource, source: int = 1) -> dict:
     """Return a snapshot of a signal generator channel's configuration."""
     p = _check_awg(source)
     return {
-        "source": source,
-        "output":    scope.query(f"{p}:OUTPut?").strip(),
-        "function":  scope.query(f"{p}:FUNCtion?").strip(),
-        "frequency": scope.query(f"{p}:FREQuency?").strip(),
-        "amplitude": scope.query(f"{p}:VOLTage?").strip(),
-        "offset":    scope.query(f"{p}:VOLTage:OFFSet?").strip(),
-        "impedance": scope.query(f"{p}:OUTPut:IMPedance?").strip(),
+        "source":     source,
+        "output":     scope.query(f"{p}:OUTPut?").strip(),
+        "function":   scope.query(f"{p}:FUNCtion?").strip(),
+        "frequency":  scope.query(f"{p}:FREQuency?").strip(),
+        "amplitude":  scope.query(f"{p}:VOLTage?").strip(),
+        "offset":     scope.query(f"{p}:VOLTage:OFFSet?").strip(),
+        "phase":      scope.query(f"{p}:PHASe?").strip(),
+        "duty_cycle": scope.query(f"{p}:PULSe:DCYCle?").strip(),
+        "impedance":  scope.query(f"{p}:OUTPut:IMPedance?").strip(),
     }
 
 
@@ -680,14 +682,15 @@ def set_source(
     frequency: float | None = None,
     amplitude: float | None = None,
     offset: float | None = None,
+    phase: float | None = None,
     duty_cycle: float | None = None,
     impedance: str | None = None,
 ) -> None:
     """Configure a signal generator channel. Only specified parameters are changed.
 
     function: SIN, SQU, RAMP, PULS, NOIS, DC, ARB.
-    frequency: Hz. amplitude: Vpp. offset: V. duty_cycle: % (pulse only).
-    impedance: OMEG (high-Z) or FIFT (50 ohm).
+    frequency: Hz. amplitude: Vpp. offset: V. phase: degrees (0–360).
+    duty_cycle: % (pulse only). impedance: OMEG (high-Z) or FIFT (50 ohm).
     """
     p = _check_awg(source)
     if function is not None:
@@ -701,6 +704,8 @@ def set_source(
         scope.write(f"{p}:VOLTage {amplitude}")
     if offset is not None:
         scope.write(f"{p}:VOLTage:OFFSet {offset}")
+    if phase is not None:
+        scope.write(f"{p}:PHASe {phase}")
     if duty_cycle is not None:
         scope.write(f"{p}:PULSe:DCYCle {duty_cycle}")
     if impedance is not None:
