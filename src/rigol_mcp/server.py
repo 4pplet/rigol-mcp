@@ -4,6 +4,7 @@ import argparse
 import base64
 import hmac
 import json
+import sys
 import os
 from datetime import datetime
 from pathlib import Path
@@ -623,6 +624,41 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
 # lazily so stdio users are unaffected by the extra dependencies.
 
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+_WILDCARD = {"0.0.0.0", "::", ""}
+
+
+def _host_patterns(hosts) -> list[str]:
+    """Host header patterns (any port) for the given names or addresses."""
+    patterns = []
+    for host in hosts:
+        host = host.strip().lower()
+        if not host:
+            continue
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"  # IPv6 literal, as it appears in a Host header
+        patterns += [host, f"{host}:*"]  # without a port (80/443) and with any port
+    return patterns
+
+
+def dns_rebinding_settings(bind_host: str, extra_hosts=()):
+    """Host/Origin checks for a server that runs without a token.
+
+    Without a token, a web page in a browser on the same machine could reach the server
+    through DNS rebinding (its own name resolving to 127.0.0.1), so only requests addressed
+    to the loopback names, the bind address and any extra names are accepted. With a token
+    this isn't needed: the page can't know it, and a reverse proxy in front may pass any Host.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    names = set(_LOOPBACK) | set(extra_hosts)
+    if bind_host not in _WILDCARD:
+        names.add(bind_host)
+    hosts = _host_patterns(sorted(names))
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=[f"http://{h}" for h in hosts] + [f"https://{h}" for h in hosts],
+    )
 
 
 async def _run() -> None:
@@ -632,12 +668,17 @@ async def _run() -> None:
 
 def _require_bearer(app, token: str):
     """ASGI wrapper that rejects requests without ``Authorization: Bearer <token>``."""
-    expected = f"Bearer {token}".encode()
+    expected = token.encode()
+
+    def authorized(header: bytes) -> bool:
+        scheme, _, credentials = header.partition(b" ")
+        # The scheme is case-insensitive (RFC 7235); the token is compared in constant time.
+        return scheme.lower() == b"bearer" and hmac.compare_digest(credentials.strip(), expected)
 
     async def wrapped(scope, receive, send):
         if scope["type"] == "http":
             provided = dict(scope["headers"]).get(b"authorization", b"")
-            if not hmac.compare_digest(provided, expected):
+            if not authorized(provided):
                 await send({
                     "type": "http.response.start",
                     "status": 401,
@@ -660,15 +701,20 @@ class _ASGIEndpoint:
         await self.app(scope, receive, send)
 
 
-def build_http_app(token: str | None = None):
-    """Starlette app serving the MCP server over streamable HTTP at ``/mcp``."""
+def build_http_app(token: str | None = None, bind_host: str = "127.0.0.1", extra_hosts=()):
+    """Starlette app serving the MCP server over streamable HTTP at ``/mcp``.
+
+    Without a token, requests must be addressed to a loopback name, the bind address or one
+    of ``extra_hosts`` (DNS-rebinding protection, see ``dns_rebinding_settings``).
+    """
     import contextlib
 
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
     from starlette.routing import Route
 
-    session_manager = StreamableHTTPSessionManager(app=server)
+    security = None if token else dns_rebinding_settings(bind_host, extra_hosts)
+    session_manager = StreamableHTTPSessionManager(app=server, security_settings=security)
     handler = session_manager.handle_request
     if token:
         handler = _require_bearer(handler, token)
@@ -708,6 +754,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=env.get("RIGOL_MCP_ALLOW_NO_AUTH", "").strip().lower() in ("1", "true", "yes", "on"),
         help="allow serving on a non-loopback address without RIGOL_MCP_TOKEN",
     )
+    parser.add_argument(
+        "--allowed-hosts",
+        default=env.get("RIGOL_MCP_ALLOWED_HOSTS", ""),
+        help="without a token: extra host names clients may use in the URL (comma-separated)",
+    )
     return parser.parse_args(argv)
 
 
@@ -721,7 +772,12 @@ def main(argv: list[str] | None = None) -> None:
 
     token = os.environ.get("RIGOL_MCP_TOKEN") or None
     check_http_exposure(args.host, token, args.allow_no_auth)
-    uvicorn.run(build_http_app(token), host=args.host, port=args.port, log_level="info")
+    extra_hosts = [h for h in args.allowed_hosts.split(",") if h.strip()]
+    if not token:
+        allowed = ", ".join(dns_rebinding_settings(args.host, extra_hosts).allowed_hosts)
+        print(f"No token set: accepting requests addressed to {allowed}", file=sys.stderr)
+    app = build_http_app(token, bind_host=args.host, extra_hosts=extra_hosts)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
