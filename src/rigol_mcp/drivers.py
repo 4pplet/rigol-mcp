@@ -15,6 +15,8 @@ Drivers are stateless singletons: every method receives the live pyvisa ``scope`
 than holding a reference, so one instance per family is shared across all connections.
 """
 
+import math
+
 import pyvisa
 
 
@@ -59,14 +61,63 @@ class ScopeDriver:
     name: str = "generic"
     memory_chunk_points: int = 0  # zero means full-memory export is unsupported
 
-    def acquisition_info(self, scope) -> dict:
-        raise NotImplementedError(f"Acquisition information is unsupported for {self.name}")
+    memory_format = "BYTE"
+    memory_format_code = 0
+    memory_sample_bytes = 1
+    memory_dtype = "uint8"
+    memory_sample_name = "uint8_sample"
 
-    def prepare_memory(self, scope, channel: str) -> None:
-        raise NotImplementedError(f"RAW export is unsupported for {self.name}")
+    def arm_memory_capture(self, scope) -> None:
+        scope.write(":SINGle")
+
+    def memory_capture_complete(self, scope) -> bool:
+        return (scope.query("*OPC?").strip() == "1"
+                and scope.query(":TRIGger:STATus?").strip().upper() == "STOP")
+
+    def acquisition_info(self, scope) -> dict:
+        return {
+            "sample_rate_hz": float(scope.query(":ACQ:SRAT?")),
+            "memory_depth_setting": scope.query(":ACQ:MDEP?").strip(),
+            "acquisition_type": scope.query(":ACQ:TYPE?").strip(),
+            "averages": scope.query(":ACQ:AVER?").strip(),
+        }
+
+    def prepare_memory(self, scope, channel: str) -> int | None:
+        from rigol_mcp.scope import check_scpi_error
+        scope.write(f":WAV:SOUR {channel}")
+        scope.write(":WAV:MODE RAW")
+        scope.write(f":WAV:FORM {self.memory_format}")
+        scope.write(":WAV:STAR 1")
+        if err := check_scpi_error(scope):
+            raise RuntimeError(f"Cannot select RAW/{self.memory_format} acquisition memory: {err}")
+        if (scope.query(":WAV:MODE?").strip() != "RAW"
+                or scope.query(":WAV:FORM?").strip() != self.memory_format
+                or scope.query(":WAV:SOUR?").strip() != channel):
+            raise RuntimeError(f"Scope did not accept RAW/{self.memory_format}/source")
+        return None
 
     def read_memory_chunk(self, scope, start: int, stop: int) -> bytes:
-        raise NotImplementedError(f"RAW export is unsupported for {self.name}")
+        from rigol_mcp.scope import _read_definite_block, check_scpi_error
+        samples = stop - start + 1
+        if not 1 <= samples <= self.memory_chunk_points or start < 1:
+            raise ValueError("Invalid acquisition-memory chunk range")
+        scope.write(f":WAV:STAR {start}")
+        scope.write(f":WAV:STOP {stop}")
+        if err := check_scpi_error(scope):
+            raise RuntimeError(f"Cannot select sample range {start}:{stop}: {err}")
+        if (int(scope.query(":WAV:STAR?")) != start
+                or int(scope.query(":WAV:STOP?")) != stop):
+            raise RuntimeError(f"Scope clamped sample range {start}:{stop}")
+        expected_bytes = samples * self.memory_sample_bytes
+        try:
+            scope.write(":WAV:DATA?")
+            data = _read_definite_block(scope, expected_length=expected_bytes)
+        except (pyvisa.errors.VisaIOError, OSError, ValueError) as exc:
+            raise MemoryTransferError(f"Binary transfer {start}:{stop} failed: {exc}") from exc
+        if len(data) != expected_bytes:
+            raise MemoryTransferError(f"Truncated chunk {start}:{stop}: received {len(data)} bytes")
+        return data
+
     # Two-source (delay/phase) item names this family accepts, and aliases mapping the
     # canonical DS1000Z names onto family-specific ones (e.g. RDELAY -> RRDELAY on DHO).
     two_source_items: frozenset[str] = frozenset()
@@ -143,46 +194,6 @@ class DS1000ZDriver(ScopeDriver):
     name = "DS1000Z"
     memory_chunk_points = 250_000
 
-    def acquisition_info(self, scope) -> dict:
-        return {
-            "sample_rate_hz": float(scope.query(":ACQ:SRAT?")),
-            "memory_depth_setting": scope.query(":ACQ:MDEP?").strip(),
-            "acquisition_type": scope.query(":ACQ:TYPE?").strip(),
-            "averages": scope.query(":ACQ:AVER?").strip(),
-        }
-
-    def prepare_memory(self, scope, channel: str) -> None:
-        from rigol_mcp.scope import check_scpi_error
-        scope.write(f":WAV:SOUR {channel}")
-        scope.write(":WAV:MODE RAW")
-        scope.write(":WAV:FORM BYTE")
-        scope.write(":WAV:STAR 1")
-        if err := check_scpi_error(scope):
-            raise RuntimeError(f"Cannot select RAW/BYTE acquisition memory: {err}")
-        if (scope.query(":WAV:MODE?").strip() != "RAW"
-                or scope.query(":WAV:FORM?").strip() != "BYTE"
-                or scope.query(":WAV:SOUR?").strip() != channel):
-            raise RuntimeError("Scope did not accept RAW/BYTE/source; screen fallback is forbidden")
-
-    def read_memory_chunk(self, scope, start: int, stop: int) -> bytes:
-        from rigol_mcp.scope import _read_definite_block, check_scpi_error
-        if not 1 <= stop - start + 1 <= self.memory_chunk_points or start < 1:
-            raise ValueError("Invalid acquisition-memory chunk range")
-        scope.write(f":WAV:STAR {start}")
-        scope.write(f":WAV:STOP {stop}")
-        if err := check_scpi_error(scope):
-            raise RuntimeError(f"Cannot select sample range {start}:{stop}: {err}")
-        if (int(scope.query(":WAV:STAR?")) != start
-                or int(scope.query(":WAV:STOP?")) != stop):
-            raise RuntimeError(f"Scope clamped sample range {start}:{stop}")
-        try:
-            scope.write(":WAV:DATA?")
-            data = _read_definite_block(scope, expected_length=stop - start + 1)
-        except (pyvisa.errors.VisaIOError, OSError, ValueError) as exc:
-            raise MemoryTransferError(f"Binary transfer {start}:{stop} failed: {exc}") from exc
-        if len(data) != stop - start + 1:
-            raise RuntimeError(f"Truncated chunk {start}:{stop}: received {len(data)} samples")
-        return data
     two_source_items = frozenset({"RDELAY", "FDELAY", "RPHASE", "FPHASE"})
 
     @classmethod
@@ -224,6 +235,47 @@ class DHODriver(ScopeDriver):
     """Rigol DHO series (12-bit)."""
 
     name = "DHO"
+    memory_chunk_points = 250_000
+    memory_format = "WORD"
+    memory_format_code = 1
+    memory_sample_bytes = 2
+    memory_dtype = "<u2"
+    memory_sample_name = "uint16_sample"
+
+    def arm_memory_capture(self, scope) -> None:
+        # Clear an earlier single sweep so SING acknowledges this arm command.
+        if scope.query(":TRIGger:SWEep?").strip().upper() == "SING":
+            scope.write(":TRIGger:SWEep NORMal")
+            if scope.query(":TRIGger:SWEep?").strip().upper() != "NORM":
+                raise RuntimeError("Scope did not clear the previous single sweep")
+        super().arm_memory_capture(scope)
+
+    def memory_capture_complete(self, scope) -> bool:
+        # DHO804 firmware 00.01.01 can keep *OPC? at 0 after a successful trigger.
+        return (scope.query(":TRIGger:SWEep?").strip().upper() == "SING"
+                and scope.query(":TRIGger:STATus?").strip().upper() == "STOP")
+
+    def prepare_memory(self, scope, channel: str) -> int:
+        from rigol_mcp.scope import check_scpi_error
+
+        super().prepare_memory(scope, channel)
+        # On DHO the preamble reports the selected range, not the record length.
+        # Expand it to the stopped acquisition's actual depth before reading it.
+        raw_depth = scope.query(":ACQ:MDEP?").strip()
+        try:
+            depth = float(raw_depth)
+        except ValueError:
+            raise RuntimeError(f"Cannot determine stopped DHO memory depth: {raw_depth!r}") from None
+        if not math.isfinite(depth) or not depth.is_integer() or not 1 <= depth <= 50_000_000:
+            raise RuntimeError(f"Invalid stopped DHO memory depth: {raw_depth!r}")
+        points = int(depth)
+        scope.write(f":WAV:STOP {points}")
+        if err := check_scpi_error(scope):
+            raise RuntimeError(f"Cannot select the complete DHO memory range: {err}")
+        if int(scope.query(":WAV:STAR?")) != 1 or int(scope.query(":WAV:STOP?")) != points:
+            raise RuntimeError(f"Scope did not select the complete {points}-point DHO record")
+        return points
+
     # DHO has no plain RDELay/FDELay/RPHase/FPHase. It exposes a 4-way matrix combining
     # rising/falling edges on each source. DS1000Z names (rise-to-rise, fall-to-fall) map
     # to the homogeneous pairs; rise-to-fall and fall-to-rise are DHO-only.

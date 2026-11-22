@@ -1,4 +1,4 @@
-"""Frozen acquisition export: streamed uint8 files and a self-describing manifest.
+"""Frozen acquisition export: streamed binary files and a self-describing manifest.
 
 Only validated, contiguous chunks are committed. No acquisition control commands
 are sent, and a failed transfer is never retried against a potentially different record.
@@ -8,6 +8,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,7 +66,7 @@ def get_acquisition_info(scope) -> dict:
     return result
 
 
-def _preamble(scope) -> dict:
+def _preamble(scope, driver) -> dict:
     raw = scope.query(":WAV:PRE?").strip()
     fields = raw.split(",")
     if len(fields) != 10:
@@ -74,10 +75,10 @@ def _preamble(scope) -> dict:
             "xreference", "yincrement", "yorigin", "yreference")
     pre = dict(zip(keys, map(float, fields)))
     if (not all(math.isfinite(v) for v in pre.values())
-            or pre["format"] != 0 or pre["type"] != 2
+            or pre["format"] != driver.memory_format_code or pre["type"] != 2
             or pre["points"] < 1 or not pre["points"].is_integer()
             or pre["xincrement"] <= 0 or pre["yincrement"] <= 0):
-        raise ValueError(f"Invalid RAW BYTE preamble: {raw!r}")
+        raise ValueError(f"Invalid RAW {driver.memory_format} preamble: {raw!r}")
     pre["points"] = int(pre["points"])
     pre["raw"] = raw
     return pre
@@ -88,6 +89,49 @@ def _require_stopped(scope):
     if status != "STOP":
         raise RuntimeError(f"Acquisition status is {status}; wait for single acquisition to "
                            "complete, or explicitly use stop before exporting. Transfer aborted.")
+
+
+def _requested_channels(channels, enabled):
+    if channels is None:
+        channels = enabled
+    if (not isinstance(channels, list) or not channels
+            or any(ch not in ("CHAN1", "CHAN2", "CHAN3", "CHAN4") for ch in channels)
+            or len(set(channels)) != len(channels)):
+        raise ValueError("channels must be a nonempty unique list of CHAN1–CHAN4")
+    if any(ch not in enabled for ch in channels):
+        raise ValueError("Requested channels are disabled or none are enabled; export never enables channels")
+    return channels
+
+
+def capture_acquisition(scope, channels=None, output_dir=None, timeout_s=10) -> dict:
+    """Arm once, wait for the single trigger, then export under one instrument lock."""
+    if not isinstance(timeout_s, (int, float)) or not 0 < timeout_s <= 120:
+        raise ValueError("timeout_s must be greater than 0 and at most 120 seconds")
+    info = get_acquisition_info(scope)
+    if "acquisition_memory" not in info["supported_transfer_modes"]:
+        raise ValueError(f"Acquisition-memory capture unsupported for {info['dialect']}")
+    channels = _requested_channels(channels, info["enabled_channels"])
+    driver = get_driver(scope)
+    deadline = time.monotonic() + timeout_s
+    previous_timeout = scope.timeout
+    # Let a status query finish cleanly even at the end of the trigger deadline.
+    # Cutting the VISA timeout to the final few ms would leave the stream out of sync.
+    scope.timeout = min(previous_timeout, 1000) if previous_timeout is not None else 1000
+    try:
+        driver.arm_memory_capture(scope)
+        if err := check_scpi_error(scope):
+            raise RuntimeError(f"SCPI error after arming acquisition: {err}")
+        while time.monotonic() < deadline:
+            if driver.memory_capture_complete(scope) and time.monotonic() < deadline:
+                break
+            time.sleep(max(0, min(0.05, deadline - time.monotonic())))
+        else:
+            scope.timeout = previous_timeout
+            scope.write(":STOP")
+            raise TimeoutError(f"No completed single acquisition within {timeout_s:g} seconds")
+    finally:
+        scope.timeout = previous_timeout
+    return export_acquisition(scope, channels, output_dir)
 
 
 def export_acquisition(scope, channels=None, output_dir=None) -> dict:
@@ -104,19 +148,12 @@ def export_acquisition(scope, channels=None, output_dir=None) -> dict:
 
 def _export_acquisition(scope, channels=None, output_dir=None) -> dict:
     """Export complete records; intentionally no stop, rearm, or range arguments."""
-    if channels is not None:
-        if (not isinstance(channels, list) or not channels
-                or any(ch not in ("CHAN1", "CHAN2", "CHAN3", "CHAN4") for ch in channels)
-                or len(set(channels)) != len(channels)):
-            raise ValueError("channels must be a nonempty unique list of CHAN1–CHAN4")
     driver = get_driver(scope)
     if not driver.memory_chunk_points:
         raise ValueError(f"Acquisition-memory export unsupported for {driver.name}; no screen fallback")
     _require_stopped(scope)
     info = get_acquisition_info(scope)
-    channels = info["enabled_channels"] if channels is None else channels
-    if not channels or any(ch not in info["enabled_channels"] for ch in channels):
-        raise ValueError("Requested channels are disabled or none are enabled; export never enables channels")
+    channels = _requested_channels(channels, info["enabled_channels"])
     _require_stopped(scope)
     saved = {key: scope.query(f":WAV:{key}?").strip()
              for key in ("SOUR", "MODE", "FORM", "STAR", "STOP")}
@@ -125,15 +162,15 @@ def _export_acquisition(scope, channels=None, output_dir=None) -> dict:
     folder = Path(tempfile.mkdtemp(prefix="acquisition-", dir=root))
     manifest_path = folder / "manifest.json"
     manifest = {
-        "schema_version": 1, "source": "acquisition_memory", "transfer_format": "BYTE",
-        "dtype": "uint8", "export_started_at": datetime.now(timezone.utc).isoformat(),
+        "schema_version": 1, "source": "acquisition_memory", "transfer_format": driver.memory_format,
+        "dtype": driver.memory_dtype, "export_started_at": datetime.now(timezone.utc).isoformat(),
         "acquisition_timestamp": None, "acquisition": info, "complete": False,
         "requested_channels": channels, "requested_range": "complete_record",
         "channels": {}, "warnings": [
             "Acquisition timestamp and completion history are unavailable; STOP and RAW metadata "
             "are checked. Do not operate the scope during export."],
         "time_formula": "xorigin + (zero_based_sample_index - xreference) * xincrement",
-        "value_formula": "(uint8_sample - yorigin - yreference) * yincrement",
+        "value_formula": f"({driver.memory_sample_name} - yorigin - yreference) * yincrement",
         "probe_scaling_applied": True,
     }
 
@@ -153,8 +190,10 @@ def _export_acquisition(scope, channels=None, output_dir=None) -> dict:
     try:
         # Read every preamble before transferring any samples.
         for ch in channels:
-            driver.prepare_memory(scope, ch)
-            pre = _preamble(scope)
+            expected_points = driver.prepare_memory(scope, ch)
+            pre = _preamble(scope, driver)
+            if expected_points is not None and pre["points"] != expected_points:
+                raise RuntimeError(f"{ch}: preamble does not describe the complete record")
             cfg = dict(info["settings"]["channels"][ch])
             cfg["units"] = scope.query(f":{ch}:UNIT?").strip()
             manifest["channels"][ch] = {
@@ -175,7 +214,7 @@ def _export_acquisition(scope, channels=None, output_dir=None) -> dict:
         save()
         for ch, meta in manifest["channels"].items():
             driver.prepare_memory(scope, ch)
-            if _preamble(scope) != meta["preamble"]:
+            if _preamble(scope, driver) != meta["preamble"]:
                 raise RuntimeError(f"{ch}: preamble changed before transfer")
             with (folder / meta["file"]).open("wb") as output:
                 for start in range(1, meta["expected_points"] + 1, driver.memory_chunk_points):
@@ -184,14 +223,15 @@ def _export_acquisition(scope, channels=None, output_dir=None) -> dict:
                     data = driver.read_memory_chunk(scope, start, stop)
                     output.write(data)
                     output.flush()
-                    meta["points"] += len(data)
+                    meta["points"] += len(data) // driver.memory_sample_bytes
                     meta["chunks"] += 1
                     meta["exported_range"] = [1, meta["points"]]  # inclusive SCPI indices
                     meta["duration_s"] = (meta["points"] - 1) * meta["time_increment_s"]
                     save()
-            if (folder / meta["file"]).stat().st_size != meta["points"]:
+            if (folder / meta["file"]).stat().st_size != meta["points"] * driver.memory_sample_bytes:
                 raise RuntimeError(f"{ch}: file sample count mismatch")
-            if _preamble(scope) != meta["preamble"]:
+            driver.prepare_memory(scope, ch)
+            if _preamble(scope, driver) != meta["preamble"]:
                 raise RuntimeError(f"{ch}: preamble changed during transfer")
             meta["complete"] = True
         _require_stopped(scope)

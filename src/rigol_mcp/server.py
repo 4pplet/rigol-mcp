@@ -26,7 +26,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from rigol_mcp.waveform_analysis import describe_waveform as _describe_waveform
-from rigol_mcp.memory_export import get_acquisition_info, export_acquisition
+from rigol_mcp.memory_export import capture_acquisition, get_acquisition_info, export_acquisition
 from rigol_mcp.scope import (
     get_scope, invalidate_scope, disconnect_scope, usb_in_use, active_backend,
     screenshot_png,
@@ -84,6 +84,10 @@ async def _call(fn, *args, _retry=True, **kwargs):
     large transfer; a reconnect on a fresh session clears it. The last failure propagates.
     """
     global _last_call_time
+
+    def invoke():
+        return fn(get_scope(), *args, **kwargs)
+
     async with _scope_lock:
         elapsed = time.monotonic() - _last_call_time
         if elapsed < _MIN_INTERVAL:
@@ -91,7 +95,13 @@ async def _call(fn, *args, _retry=True, **kwargs):
         try:
             for attempt in range(1, _MAX_ATTEMPTS + 1):
                 try:
-                    return fn(get_scope(), *args, **kwargs)
+                    worker = asyncio.create_task(asyncio.to_thread(invoke))
+                    try:
+                        return await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        # A transfer running in a worker still owns the scope on cancellation.
+                        await asyncio.gather(worker, return_exceptions=True)
+                        raise
                 except _RETRYABLE:
                     invalidate_scope()  # drop the session so the next attempt reconnects
                     if not _retry or attempt == _MAX_ATTEMPTS:
@@ -120,8 +130,8 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="export_acquisition",
-            description="Export the complete stopped acquisition memory to uint8 binary files and a "
-                        "JSON manifest (DS1000Z). Returns paths and compact integrity/timing summaries. "
+            description="Export the complete stopped acquisition memory to binary files and a "
+                        "JSON manifest. Returns paths and compact integrity/timing summaries. "
                         "Defaults to all enabled analog channels. Requires STOP; never stops, rearms, "
                         "enables channels, or falls back to screen data. Keep scope controls untouched "
                         "during export. Partial transfers are saved and explicitly marked incomplete.",
@@ -134,6 +144,25 @@ async def list_tools() -> list[types.Tool]:
                     "output_dir": {"type": "string", "description": "Local parent directory; "
                                    "defaults to RIGOL_WAVEFORM_DIR or waveforms/. A unique export "
                                    "subdirectory is created; existing captures are never overwritten."},
+                },
+            },
+        ),
+        types.Tool(
+            name="capture_acquisition",
+            description=(
+                "Arm a single acquisition, wait for it to stop, then export the full record. "
+                "Uses the scope's existing trigger and enabled channels and leaves the scope stopped. "
+                "A trigger timeout produces no export."
+            ),
+            inputSchema={
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "channels": {"type": "array", "minItems": 1, "maxItems": 4,
+                                 "uniqueItems": True, "items": {"type": "string",
+                                 "enum": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"]}},
+                    "output_dir": {"type": "string", "description": "Parent directory on the MCP host"},
+                    "timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 120,
+                                  "default": 10, "description": "Seconds to wait for the trigger"},
                 },
             },
         ),
@@ -458,6 +487,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             raise ValueError(f"Unsupported export arguments: {sorted(unknown)}; only complete records supported")
         result = await _call(export_acquisition, channels=arguments.get("channels"),
                              output_dir=arguments.get("output_dir"), _retry=False)
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+    if name == "capture_acquisition":
+        result = await _call(capture_acquisition, channels=arguments.get("channels"),
+                             output_dir=arguments.get("output_dir"),
+                             timeout_s=arguments.get("timeout_s", 10), _retry=False)
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     if name == "screenshot":
         png_bytes = await _call(screenshot_png)

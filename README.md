@@ -255,7 +255,8 @@ All sessions share one instrument connection, and scope access stays serialised.
 | `measure` | Query any single-channel measurement: VMAX, VMIN, VPP, VTOP, VBASE, VAMP, VAVG, VRMS, PVRMS, VUPPER, VMID, VLOWER, VARIANCE, FREQUENCY, PERIOD, PWIDTH, NWIDTH, PDUTY, NDUTY, RTIME, FTIME, OVERSHOOT, PRESHOOT, PSLEWRATE, NSLEWRATE, TVMAX, TVMIN, MAREA, MPAREA, PPULSES, NPULSES, PEDGES, NEDGES |
 | `measure_between` | Query delay or phase between two channels. DS1000Z: RDELAY, FDELAY, RPHASE, FPHASE. DHO: RRDELAY/RFDELAY/FRDELAY/FFDELAY, RRPHASE/RFPHASE/FRPHASE/FFPHASE (DS1000Z names auto-map to the homogeneous-edge DHO equivalents) |
 | `get_waveform` | Download and analyse waveform data (NORM screen buffer: up to 1200 pts on DS1000Z, 1000 on DHO); returns text analysis by default, raw time/voltage arrays with `raw_data=true` |
-| `export_acquisition` | Save complete stopped DS1000Z acquisition memory as binary samples and a JSON manifest; returns paths, counts, timing, and integrity warnings |
+| `export_acquisition` | Save complete stopped DS1000Z or DHO acquisition memory with a JSON manifest |
+| `capture_acquisition` | Arm a single capture, wait for the trigger, and export the full record |
 
 ### Full acquisition-memory export
 
@@ -265,14 +266,19 @@ the NORM screen buffer. For offline filtering or protocol analysis, use
 Omit `channels` to export all currently enabled analog channels. `output_dir` optionally
 selects the parent directory on the server's machine. Each export gets a unique subdirectory.
 
-The scope must already report STOP. A single acquisition that has finished is suitable;
+For an upcoming event, call `capture_acquisition` with `timeout_s` (default 10, at most 120)
+using the instrument's existing trigger and enabled channels. The scope stays stopped after
+a successful capture. If no trigger completes in time, the tool stops acquisition and creates
+no export. `output_dir` and `channels` work the same way as for `export_acquisition`.
+
+For `export_acquisition`, the scope must already report STOP. A completed single capture is suitable;
 WAIT, RUN, and AUTO are rejected. Stopping is a separate, explicit action. The instrument
 does not expose a capture timestamp or completion history through this API, so STOP
 alone cannot prove that a previous trigger completed. Keep the front panel and other
 SCPI clients idle throughout the export. No run, single, autoscale, channel-enable, or
 acquisition-setting writes are issued by the export.
 
-The tool selects RAW/BYTE through the DS1000Z driver, queries each channel's preamble,
+The tool selects RAW/BYTE for DS1000Z and RAW/WORD for DHO, queries each channel's preamble,
 and streams the complete record in chunks of at most 250,000 samples. It checks range
 readback, binary block lengths, file sizes, stopped status, and metadata consistency.
 Waveform source, mode, format, and range are restored and checked afterward; restoration
@@ -281,18 +287,19 @@ command write, or a binary block has invalid framing, restoration is skipped and
 connection is invalidated: a delayed or partial reply could otherwise be mistaken for
 the next SCPI query's response. Local filesystem failures do not by themselves prevent
 restoration. The tool reports when transfer settings
-were not restored; it does not reconnect or retry that export. DHO memory export is currently unsupported and never
-falls back to the screen buffer. `AUTO` memory depth is reported as a setting; actual
-record lengths come from RAW preambles rather than a presumed installed memory option.
+were not restored; it does not reconnect or retry that export. On DHO, the tool checks the
+stopped acquisition depth against the full-range preamble, since narrow ranges produce
+shorter preambles. On DS1000Z, the RAW preamble gives the record length.
 
 The returned `manifest_path` identifies a JSON file beside `CHAN1.bin`, etc. Samples
-are unsigned 8-bit codes, without a SCPI header. The manifest contains instrument and
+are unsigned 8-bit codes for DS1000Z and little-endian unsigned 16-bit codes for DHO.
+The SCPI headers are removed. The manifest contains instrument and
 acquisition settings, UTC export timestamps, preambles, channel units and probe factors,
 requested/exported ranges (one-based, inclusive), chunk/sample counts, and completeness.
 Duration is the time between first and last saved sample: `(points - 1) * interval`.
 Each channel has its own trigger-relative time axis; alignment differences are flagged.
 Preamble scaling already includes the configured probe ratio; do not multiply it again.
-Transfer and conversion follow the [Rigol programming guide, waveform commands](https://www.rigol.com/dam/global/downloads/brochures/en/program-guide/oscilloscopes/DS1000Z_ProgrammingGuide_EN.pdf?t=1760982668513).
+The waveform commands are documented in the [DS1000Z programming guide](https://www.rigol.com/dam/global/downloads/brochures/en/program-guide/oscilloscopes/DS1000Z_ProgrammingGuide_EN.pdf?t=1760982668513) and [DHO800/DHO900 programming guide](https://download.rigol.com/en/Manual/Digital%20Oscilloscope/DHO800/DHO800900_ProgrammingGuide_EN.pdf).
 
 Read an export locally in Python (NumPy is needed only for this example):
 
@@ -305,7 +312,7 @@ path = Path("waveforms/acquisition-EXAMPLE/manifest.json")  # use returned manif
 manifest = json.loads(path.read_text(encoding="utf-8"))
 assert manifest["complete"], manifest.get("error")
 channel = manifest["channels"]["CHAN1"]
-codes = np.fromfile(path.parent / channel["file"], dtype=np.uint8)
+codes = np.fromfile(path.parent / channel["file"], dtype=manifest["dtype"])
 assert codes.size == channel["points"]
 p = channel["preamble"]
 times_s = p["xorigin"] + (np.arange(codes.size) - p["xreference"]) * p["xincrement"]
@@ -414,7 +421,7 @@ uv run --extra test pytest      # or: uv sync --extra test && uv run pytest
 
 - USB driver setup is platform-specific: **Windows** needs WinUSB (via Zadig) or NI-VISA/UltraSigma; **Linux** needs `libusb` access (a udev rule) or NI-VISA; **macOS** typically works through `libusb` with no setup. The server auto-detects the backend — see [USB connection](#usb-connection). LAN needs no driver setup on any platform.
 - No support for math channels, digital channels (MSO), or protocol decode in the current tools yet — use `send_raw` for those
-- `get_waveform` uses the NORMAL screen buffer; `export_acquisition` supports full RAW memory on DS1000Z only. Hardware validation against a calibrated signal remains necessary for absolute time/voltage accuracy.
+- `get_waveform` uses the NORMAL screen buffer; `export_acquisition` supports full RAW memory on DS1000Z and DHO. Hardware validation against a calibrated signal remains necessary for absolute time/voltage accuracy.
 
 ## License
 
