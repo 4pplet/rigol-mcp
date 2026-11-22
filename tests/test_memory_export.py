@@ -1,6 +1,7 @@
 """Offline RAW transfer tests with a stateful scope and real binary block readers."""
 
 import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -163,9 +164,12 @@ def test_restoration_failure_reported(tmp_path):
     assert any("Could not restore" in w for w in result["warnings"])
 
 
-def test_unsupported_family(tmp_path):
-    scope = FakeScope({"*IDN?": "RIGOL TECHNOLOGIES,DHO924S,serial,firmware"})
-    with pytest.raises(ValueError, match="unsupported for DHO"):
+def test_unsupported_family(tmp_path, monkeypatch):
+    from rigol_mcp.drivers import ScopeDriver
+
+    monkeypatch.setattr(sc, "_driver", ScopeDriver())
+    scope = FakeScope()
+    with pytest.raises(ValueError, match="unsupported for generic"):
         mem.export_acquisition(scope, output_dir=tmp_path)
     assert not scope.written
 
@@ -408,22 +412,76 @@ def test_export_rejects_corrupt_length_before_reading_payload(tmp_path):
     assert "Unexpected payload length" in result["error"]
 
 
-def test_info_reports_unsupported_dialect_without_memory_queries(monkeypatch):
-    from rigol_mcp.drivers import DHO
-    monkeypatch.setattr(sc, "_driver", DHO)
+class DHOMemoryScope(MemoryScope):
+    def __init__(self, points=250_003, status="STOP", completes=True):
+        super().__init__(points, status)
+        self.completes = completes
+        self.armed = False
+        self.polls = 0
+        self.sweep = "AUTO"
 
-    class DHOScope(MemoryScope):
-        def query(self, cmd):
-            assert not cmd.startswith(":ACQ:")
-            if cmd == "*IDN?":
-                return "RIGOL TECHNOLOGIES,DHO924S,serial,firmware"
-            return super().query(cmd)
+    def query(self, cmd):
+        if cmd == "*IDN?":
+            return "RIGOL TECHNOLOGIES,DHO804,DHO8A000000000,00.01.01"
+        if cmd == ":ACQ:MDEP?":
+            return f"{self.points:.8E}"
+        if cmd == ":WAV:PRE?":
+            points = int(self.transfer["STOP"]) - int(self.transfer["STAR"]) + 1
+            return f"1,2,{points},1,5e-7,-0.08,0,6.6667e-6,0,32768"
+        if cmd == ":TRIGger:SWEep?":
+            return self.sweep
+        if cmd == ":TRIGger:STATus?" and self.armed and self.status == "WAIT":
+            self.polls += 1
+            if self.completes and self.polls >= 2:
+                self.status = "STOP"
+        return super().query(cmd)
 
-    scope = DHOScope()
-    result = mem.get_acquisition_info(scope)
-    assert result["supported_transfer_modes"] == ["screen"]
-    assert result["dialect"] == "DHO" and result["warnings"]
-    assert not scope.written
+    def write(self, cmd):
+        super().write(cmd)
+        if cmd == ":SINGle":
+            self.armed = True
+            self.sweep = "SING"
+            self.status = "WAIT"
+        elif cmd == ":TRIGger:SWEep NORMal":
+            self.sweep = "NORM"
+        elif cmd == ":STOP":
+            self.status = "STOP"
+        elif cmd == ":WAV:DATA?":
+            _, start, stop = self.reads[-1]
+            samples = [32768 + (i % 101) for i in range(start - 1, stop)]
+            self.load(make_block(struct.pack(f"<{len(samples)}H", *samples)))
+
+
+def test_dho_full_word_export_restores_transfer_settings(tmp_path):
+    scope = DHOMemoryScope()
+    result = mem.export_acquisition(scope, ["CHAN1"], tmp_path)
+    saved = manifest(result)
+    assert result["complete"] and scope.transfer == scope.original
+    assert saved["transfer_format"] == "WORD" and saved["dtype"] == "<u2"
+    assert saved["acquisition"]["dialect"] == "DHO"
+    assert scope.reads == [("CHAN1", 1, 250000), ("CHAN1", 250001, 250003)]
+    data = (Path(result["manifest_path"]).parent / "CHAN1.bin").read_bytes()
+    assert len(data) == scope.points * 2
+    assert struct.unpack_from("<HH", data) == (32768, 32769)
+    assert struct.unpack_from("<H", data, len(data) - 2)[0] == 32768 + (scope.points - 1) % 101
+    assert saved["channels"]["CHAN1"]["points"] == scope.points
+
+
+def test_capture_waits_for_arm_and_then_exports(tmp_path):
+    scope = DHOMemoryScope(points=1024, status="AUTO")
+    result = mem.capture_acquisition(scope, ["CHAN1"], tmp_path, timeout_s=1)
+    assert result["complete"] and scope.status == "STOP"
+    assert scope.armed and scope.polls == 2 and scope.written.count(":SINGle") == 1
+    assert ":STOP" not in scope.written
+
+
+def test_capture_timeout_stops_without_exporting_prior_samples(tmp_path):
+    scope = DHOMemoryScope(points=1024, completes=False)
+    scope.sweep = "SING"  # a previous stopped capture
+    with pytest.raises(TimeoutError, match="No completed single acquisition"):
+        mem.capture_acquisition(scope, ["CHAN1"], tmp_path, timeout_s=0.01)
+    assert scope.written == [":TRIGger:SWEep NORMal", ":SINGle", ":STOP"]
+    assert not scope.reads and not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("failure", ["visa", "os", "decode"])
